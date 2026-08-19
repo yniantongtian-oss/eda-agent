@@ -131,7 +131,7 @@ jobs:
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: eda-agent-dist-${{ github.sha }}
+          name: eda-agent-dist-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             dist/*.whl
             dist/*.tar.gz
