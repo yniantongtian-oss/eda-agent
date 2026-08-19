@@ -17,20 +17,27 @@ explicitly says otherwise.
 
 ## Reporting a vulnerability
 
-Please **do not** open a public GitHub issue for security problems.
+Please **do not** open a public GitHub issue or pull request for security
+problems.
 
-Email reports to **info@salitronic.com** with:
+For this fork, email reports privately to **yniantongtian@163.com** with:
 
 - A description of the issue and its impact
 - Steps to reproduce, including a minimal MCP call sequence or protocol
   payload when relevant
-- The affected `eda-agent` version and selected backend
-- The EDA application/version involved (Altium Designer, KiCad, or EasyEDA Pro)
+- The affected `eda-agent` version and exact commit SHA if known
+- The selected backend and EDA application/version involved
+- Whether the issue also reproduces on the upstream `salitronic/eda-agent`
+  repository
 - Any suggested mitigation
 
 You should receive an acknowledgement within 7 days. If the report is
 confirmed, a fix will be prepared and released; coordinated disclosure timing
 will be agreed with the reporter.
+
+If the same vulnerability reproduces unchanged in upstream
+`salitronic/eda-agent`, coordinate disclosure with the upstream project as well.
+Do not substitute a public upstream issue for a private security report.
 
 ## Scope
 
@@ -44,6 +51,7 @@ In scope:
 - The local web dashboard and other local control surfaces shipped by this
   repository
 - Release/package integrity for the `eda-agent` Python distribution
+- Fork-specific CI, packaging, EasyEDA delivery helpers, and release artifacts
 
 Out of scope:
 
