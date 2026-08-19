@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "eda-agent"
 version = "0.5.0"
-description = "MCP server for EDA tool automation, currently supports Altium Designer. Around 400 tools for schematic, PCB, and library ops via DelphiScript bridge."
+description = "MCP server for AI-assisted EDA automation across Altium Designer, KiCad, and EasyEDA Pro, with around 400 tools on the default Altium backend."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
     { name = "George Saliba", email = "george.saliba@salitronic.com" }
 ]
-keywords = ["altium", "mcp", "pcb", "eda", "schematic"]
+keywords = ["altium", "kicad", "easyeda", "mcp", "model-context-protocol", "ai", "pcb", "eda", "schematic"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
