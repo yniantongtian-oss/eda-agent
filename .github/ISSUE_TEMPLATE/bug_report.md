@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a defect in the MCP server or the Altium bridge
+about: Report a defect in the MCP server or an EDA backend
 title: "[bug] "
 labels: bug
 assignees: ''
@@ -29,24 +29,28 @@ blocks.
 
 - `eda-agent` version: <output of `eda-agent --version`>
 - Python version: <output of `python --version`>
-- Altium Designer version: <Help > About in Altium>
-- Windows version:
-- MCP client (Claude Code / Claude Desktop / other):
+- Backend: <altium / kicad / easyeda / both>
+- EDA application and version: <Altium Designer / KiCad / EasyEDA Pro>
+- Operating system and version:
+- MCP client (Claude Code / Codex / Claude Desktop / other):
+- Toolset, if non-default: <full / minimal>
 
-## Workspace artefacts (if applicable)
+## Diagnostics
 
-If a tool call failed, paste the relevant `request.json` and
-`response.json` from `%USERPROFILE%\EDA Agent\workspace\`. Redact any
-proprietary path or design data first.
+Include the smallest backend-specific evidence that reproduces the problem.
+Redact proprietary paths, design data, credentials, and customer information.
 
-```json
-// request.json
-```
+- Altium: relevant workspace response / `last_fault.json`, plus whether the
+  polling loop was running
+- KiCad: the failing tool response and whether the KiCad API server was enabled
+- EasyEDA Pro: the failing tool response, active editor tab, and whether the
+  extension reported connected
 
-```json
-// response.json
+```text
+paste diagnostics here
 ```
 
 ## Additional context
 
-Logs, screenshots, related issues.
+Logs, screenshots, related issues, and whether the problem reproduces after a
+fresh `eda-agent doctor` / reconnect where applicable.
