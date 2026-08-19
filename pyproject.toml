@@ -73,6 +73,7 @@ web = [
 
 [project.scripts]
 eda-agent = "eda_agent.server:main"
+eda-agent-easyeda-extension = "eda_agent.easyeda_extension_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/salitronic/eda-agent"
