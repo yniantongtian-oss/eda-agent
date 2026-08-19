@@ -13,28 +13,39 @@ Closes #
 - [ ] Breaking change (fix or feature that would change existing behaviour)
 - [ ] Documentation only
 - [ ] Refactor / chore (no behavioural change)
+- [ ] Release / packaging / CI hardening
 
 ## Areas touched
 
 - [ ] Python MCP server (`src/eda_agent/`)
-- [ ] DelphiScript bridge (`scripts/altium/`)
-- [ ] Installer (`installer/`)
-- [ ] Tests
-- [ ] Docs
+- [ ] Altium bridge (`scripts/altium/`)
+- [ ] KiCad backend
+- [ ] EasyEDA Pro backend / extension (`extensions/easyeda/`)
+- [ ] Packaging / release artifacts
+- [ ] Tests / CI
+- [ ] Docs / contributor support
 
 ## Testing
 
-- [ ] `pytest` passes locally
+- [ ] Python 3.11 tests pass
+- [ ] Python 3.12 tests pass
+- [ ] `python -m compileall -q src tests scripts` passes
 - [ ] Pascal cross-validation passes (if Pascal touched)
-- [ ] Manually exercised in Altium (if behaviour requires it): describe
-      what you ran below
+- [ ] Release artifact build + clean-wheel smoke test passes (if packaging changed)
+- [ ] Manually exercised in the affected EDA application when behaviour requires
+      live verification; describe what you ran below
 
 Notes:
 
-## Checklist
+## Safety / compatibility checklist
 
-- [ ] Commits follow the conventional-commit style used in this repo
-- [ ] No secrets, customer designs, or proprietary library paths are
-      included in the diff or test fixtures
-- [ ] If a Pascal file changed, the PR description notes that reviewers
-      must restart Altium to test
+- [ ] No secrets, customer designs, credentials, or proprietary library paths
+      are included in the diff or test fixtures
+- [ ] Public tool names / schemas remain compatible, or the breaking change is
+      explicitly documented
+- [ ] If a Pascal file changed, reviewers know Altium caches scripts and must
+      reload/restart before live verification
+- [ ] Destructive EDA operations retain confirmation/checkpoint guards where
+      applicable
+- [ ] User-facing docs and security policy remain consistent with the backends
+      and version actually shipped
