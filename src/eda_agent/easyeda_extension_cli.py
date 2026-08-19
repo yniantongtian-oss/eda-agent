@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Locate or build the EasyEDA Pro editor extension shipped in the wheel."""
+"""Locate or build the EasyEDA Pro editor extension shipped with eda-agent."""
 
 from __future__ import annotations
 
@@ -11,8 +11,23 @@ from pathlib import Path
 
 
 def packaged_extension_dir() -> Path:
-    """Return the read-only extension source directory inside the package."""
-    return Path(__file__).resolve().parent / "easyeda_extension"
+    """Return the extension source directory for wheel or editable installs."""
+    module = Path(__file__).resolve()
+
+    # Wheel installs receive the force-included payload beside this module.
+    packaged = module.parent / "easyeda_extension"
+    if packaged.is_dir():
+        return packaged
+
+    # Editable installs execute this module from <repo>/src/eda_agent, while
+    # the source-of-truth extension remains under <repo>/extensions/easyeda.
+    source_tree = module.parents[2] / "extensions" / "easyeda"
+    if source_tree.is_dir():
+        return source_tree
+
+    # Return the wheel location so the caller's error names the path shape we
+    # expect instead of hiding it behind a None/sentinel.
+    return packaged
 
 
 def _copy_extension_source(dest: Path, *, force: bool) -> Path:
@@ -21,7 +36,7 @@ def _copy_extension_source(dest: Path, *, force: bool) -> Path:
     missing = [name for name in required if not (source / name).is_file()]
     if missing:
         raise RuntimeError(
-            "installed wheel is missing EasyEDA extension payload: "
+            "eda-agent installation is missing EasyEDA extension payload: "
             + ", ".join(missing)
         )
 
@@ -39,8 +54,8 @@ def _copy_extension_source(dest: Path, *, force: bool) -> Path:
     else:
         dest.mkdir(parents=True)
 
-    # Copy only the immutable source payload. Generated dist/ and .eext files
-    # are deliberately absent from the wheel and are created in this writable
+    # Copy only immutable source payload. Generated dist/ and .eext files are
+    # deliberately absent from the wheel and are created in this writable
     # destination by the canonical extension build script.
     for item in source.iterdir():
         if item.is_file():
@@ -74,24 +89,22 @@ def main() -> int:
         prog="eda-agent-easyeda-extension",
         description=(
             "Locate or build the EasyEDA Pro editor extension bundled with "
-            "the installed eda-agent wheel."
+            "eda-agent."
         ),
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("path", help="Print the packaged extension source directory")
+    sub.add_parser("path", help="Print the extension source directory")
 
     build = sub.add_parser(
         "build",
-        help="Copy the packaged extension to a writable directory and build .eext",
+        help="Copy the extension to a writable directory and build .eext",
     )
     build.add_argument(
         "--dest",
         type=Path,
         default=Path.cwd() / "eda-agent-easyeda-extension",
-        help=(
-            "Writable build directory (default: ./eda-agent-easyeda-extension)"
-        ),
+        help="Writable build directory (default: ./eda-agent-easyeda-extension)",
     )
     build.add_argument(
         "--force",
@@ -107,7 +120,7 @@ def main() -> int:
             source = packaged_extension_dir()
             if not source.is_dir():
                 raise RuntimeError(
-                    "installed package does not contain the EasyEDA extension payload"
+                    "eda-agent installation does not contain the EasyEDA extension payload"
                 )
             print(source)
             return 0
