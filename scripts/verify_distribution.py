@@ -55,6 +55,11 @@ def verify_wheel(wheel: Path, version: str, requires_python: str) -> None:
                 "eda_agent/scripts/Altium_API.PrjScr",
                 "eda_agent/scripts/Dispatcher.pas",
                 "eda_agent/scripts/Main.pas",
+                "eda_agent/easyeda_extension/BUILD_STAMP.json",
+                "eda_agent/easyeda_extension/build.py",
+                "eda_agent/easyeda_extension/extension.json",
+                "eda_agent/easyeda_extension/main.js",
+                "eda_agent/easyeda_extension_cli.py",
                 ".dist-info/METADATA",
                 ".dist-info/entry_points.txt",
                 "/LICENSE",
@@ -80,9 +85,15 @@ def verify_wheel(wheel: Path, version: str, requires_python: str) -> None:
             name for name in names if name.endswith(".dist-info/entry_points.txt")
         )
         entry_points = archive.read(entry_points_name).decode("utf-8")
-        expected = "eda-agent = eda_agent.server:main"
-        if expected not in entry_points:
-            raise AssertionError(f"wheel console entry point is missing: {expected}")
+        expected_entries = (
+            "eda-agent = eda_agent.server:main",
+            "eda-agent-easyeda-extension = eda_agent.easyeda_extension_cli:main",
+        )
+        missing_entries = [entry for entry in expected_entries if entry not in entry_points]
+        if missing_entries:
+            raise AssertionError(
+                f"wheel console entry points are missing: {missing_entries}"
+            )
 
 
 def verify_sdist(sdist: Path) -> None:
@@ -98,6 +109,11 @@ def verify_sdist(sdist: Path) -> None:
                 "/pyproject.toml",
                 "/scripts/altium/Altium_API.PrjScr",
                 "/scripts/altium/Dispatcher.pas",
+                "/extensions/easyeda/BUILD_STAMP.json",
+                "/extensions/easyeda/build.py",
+                "/extensions/easyeda/extension.json",
+                "/extensions/easyeda/main.js",
+                "/src/eda_agent/easyeda_extension_cli.py",
                 "/src/eda_agent/server.py",
             ),
         )
