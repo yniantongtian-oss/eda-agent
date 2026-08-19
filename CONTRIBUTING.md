@@ -1,147 +1,207 @@
 # Contributing to eda-agent
 
-Thanks for your interest. This project is an early-stage MCP server that
-bridges large language models to Altium Designer through a DelphiScript
-side-channel. It is single-maintainer and Windows-only by necessity (Altium
-runs on Windows).
+Thanks for your interest. `eda-agent` is an early-stage MCP server for live EDA
+automation. The default and most complete backend is Altium Designer through a
+DelphiScript bridge; KiCad and EasyEDA Pro are optional backends with their own
+native/local integration paths.
 
-Before opening a non-trivial change, please file an issue first so we can
-discuss scope. Drive-by patches that change architecture or rename public
-APIs are unlikely to land without prior agreement.
+Keep non-trivial changes focused and explain the user-visible problem before the
+implementation. If Issues are enabled on the repository you are contributing
+to, use an issue for architecture-level proposals first. On forks where Issues
+are disabled, a narrowly scoped pull request with a clear problem statement is
+preferred over an undocumented architectural rewrite.
 
 ## Ground rules
 
 - Be respectful. See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
-- Security-sensitive issues do **not** go in public issues. See
+- Security-sensitive issues do **not** go in public issues or PRs. See
   [`SECURITY.md`](SECURITY.md).
-- By contributing you agree your contribution is licensed under
-  Apache-2.0 (the project licence).
+- By contributing you agree your contribution is licensed under Apache-2.0.
+- Do not include customer designs, credentials, private library paths, or other
+  proprietary material in fixtures, logs, screenshots, or examples.
 
 ## Development environment
 
-Required:
+Required for the Python/offline suite:
 
-- Windows 10 / 11
-- A licensed Altium Designer install (the Pascal side is tested against
-  recent versions, but the API is stable across releases)
-- Python 3.11 or newer
+- Python 3.11 or 3.12 (both are continuously tested in CI)
 - `pip install -e .[dev]` from the repository root
 
-Optional but recommended:
+Required for the full Altium path:
 
-- Free Pascal (`fpc`) for the offline Pascal cross-validation tests under
-  `tests/cross_validate_pascal.pas`
-- An IDE that understands `pyproject.toml` (VS Code, PyCharm)
+- Windows 10 / 11
+- A licensed Altium Designer installation
+- The bundled DelphiScript project installed with `eda-agent install-scripts`
+
+Backend-specific optional setup:
+
+- KiCad 9+ with its API server enabled, plus `pip install -e .[kicad,dev]`
+- EasyEDA Pro with the extension under `extensions/easyeda/` imported and its
+  external-interaction permission enabled
+- Free Pascal (`fpc`) for the Pascal/Python cross-validation tests
+
+The full supported CI runtime is Windows because the Altium bridge requires it.
+Some backend-neutral, KiCad, and EasyEDA code is platform-neutral, but this
+repository does not claim an additional operating system as release-certified
+until CI explicitly tests it.
 
 ## Running the agent locally
 
-1. Install the package in editable mode: `pip install -e .[dev]`
-2. Install the Altium-side scripts: `eda-agent install-scripts`
-3. In Altium, open `Altium_API.PrjScr` and run `Dispatcher > StartMCPServer`
-4. From an MCP client, connect to the `eda-agent` stdio server
+Install the development package first:
 
-The Python side polls a workspace directory for JSON responses from the
-Pascal side; the workspace pointer lives at
-`C:\ProgramData\eda-agent\workspace-path.txt`.
+```bash
+pip install -e .[dev]
+eda-agent --version
+```
+
+Select one backend per MCP server process:
+
+```bash
+eda-agent --backend altium
+eda-agent --backend kicad
+eda-agent --backend easyeda
+```
+
+For Altium:
+
+1. Run `eda-agent install-scripts`.
+2. In Altium, load `Altium_API.PrjScr` and run
+   `Dispatcher > StartMCPServer`.
+3. Connect your MCP client to the local `eda-agent` stdio server.
+4. Use `eda-agent doctor` when diagnosing a bridge/setup problem.
+
+For KiCad, enable **Preferences > Plugins > KiCad API server** before connecting.
+For EasyEDA Pro, import the shipped extension, enable external interaction for
+extensions/scripts, open a design tab, and let the extension connect to the
+local loopback bridge.
+
+See [`docs/BACKENDS.md`](docs/BACKENDS.md) for the backend-specific contract and
+known limitations.
 
 ## Tests
 
-- `pytest` runs the offline suite, and is safe with Altium open
-- `EDA_AGENT_INTEGRATION=1 pytest` adds the live-Altium tests
-- `python tests/test_cross_validate.py` runs the offline Pascal validator
-  (requires Free Pascal in PATH)
+Before requesting review, run the same basic gates CI runs:
 
-**A plain `pytest` does not touch a running Altium.** The nine tests
-under `tests/integration/` drive a real session, and they are skipped at
-COLLECTION unless `EDA_AGENT_INTEGRATION=1`, so no fixture runs, no
-bridge is built and no request file is written.
+```bash
+python -m compileall -q src tests scripts
+python -m pytest tests/ -q
+python scripts/altium/lint.py
+python scripts/altium/build.py
+```
 
-That gate is recent. Before it, those tests reached the skip only after
-`real_bridge` had already pinged, and `fixture_project_loaded` called
-`project.open` with no skip in front of it at all, so running the suite
-against a healthy polling loop would have opened the fixture project in
-whatever Altium you had in front of you.
-`tests/test_integration_tests_are_opt_in.py` holds the line, and checks
-it end to end by running the directory in a subprocess with the
-workspace redirected and asserting nothing was written there.
+Free Pascal makes `tests/test_cross_validate.py` exercise the compiled Pascal
+helpers rather than skipping that part of the suite.
 
-Once you opt in, those tests still only read: they open and compile a
-project and query it, and send no command that changes the design. A
-test that would is rejected by
-`tests/test_integration_suite_is_non_destructive.py`. Verification that
-has to modify something belongs in `docs/RELEASE_VERIFICATION.md`.
+**A normal test run must not touch a live EDA design.** Live integration checks
+must remain explicitly opt-in. For Altium, `EDA_AGENT_INTEGRATION=1 pytest`
+enables the live-Altium integration suite; without that environment variable the
+integration directory is collection-gated so fixtures cannot open or modify a
+real project accidentally.
+
+The integration suite is intentionally read-only. A test that would mutate a
+live design is rejected by the non-destructive integration guard. Verification
+that must modify something belongs in `docs/RELEASE_VERIFICATION.md`, should use
+a disposable/copy project, and should checkpoint before destructive operations.
 
 The Pascal scripts cannot be fully unit-tested without a running Altium
-instance; cross-validation runs the same logic compiled by `fpc` against
-mocked Altium objects and is the only honest pre-Altium check.
+instance. The linter, bundle build, and Free Pascal cross-validation are the
+pre-Altium checks; the release verification document records the live checks
+that still require the real DelphiScript engine.
 
-### Writing a guard
+## Release artifact verification
 
-A good part of this suite is guards: tests that compare a fact stated in
-one place against the code that decides it, because the two drift and
-nothing else notices. If you add one, four things have caught real
-mistakes here and are worth copying.
+An editable install can pass while the wheel users receive is incomplete. CI
+therefore builds the real wheel and source distribution and runs:
 
-**Mutate the defect it exists to catch.** A guard that has never failed
-has not been tested. Break the thing on purpose, confirm the guard
-fails, put it back. Several guards in this suite passed on their first
-run while checking nothing, and only mutation found that.
+```bash
+python scripts/verify_distribution.py
+```
 
-**Assert the check found something.** If the guard parses a table, a
-document or a registry, assert the parse was non-empty and roughly the
-expected size. A renamed heading otherwise turns the guard into a test
-that passes because it read zero rows. Existing examples:
+The verifier checks package metadata, the console entry point, required
+LICENSE/NOTICE files, and the bundled Altium scripts. CI then installs the wheel
+into a clean virtual environment and smoke-tests `eda-agent --version`,
+`eda-agent --help`, and `eda-agent scripts-path`.
+
+If this gate fails, fix the package. Do not weaken the verifier merely to make a
+release green.
+
+## Writing a guard
+
+A good part of this suite is guards: tests that compare a fact stated in one
+place against the code that decides it, because the two drift and nothing else
+notices. Four practices have caught real mistakes here and are worth copying.
+
+**Mutate the defect it exists to catch.** A guard that has never failed has not
+been tested. Break the thing on purpose, confirm the guard fails, put it back.
+Several guards in this suite passed on their first run while checking nothing,
+and only mutation found that.
+
+**Assert the check found something.** If the guard parses a table, a document or
+a registry, assert the parse was non-empty and roughly the expected size. A
+renamed heading otherwise turns the guard into a test that passes because it
+read zero rows. Existing examples include
 `test_the_scan_sees_what_it_claims_to`,
-`test_the_widened_scan_actually_sees_something`,
+`test_the_widened_scan_actually_sees_something`, and
 `test_the_check_can_actually_fail`.
 
-**Do not let the guard match its own explanation.** If it searches for a
-literal and a nearby comment names that literal, the comment satisfies
-the search. `tests/test_no_em_dashes.py` builds its characters with
-`chr()` for this reason, and the CI check in
-`tests/test_version_is_unreleased.py` ignores comment lines because its
-own rationale contains the string it looks for.
+**Do not let the guard match its own explanation.** If it searches for a literal
+and a nearby comment names that literal, the comment can satisfy the search.
+Build awkward sentinel characters programmatically or otherwise exclude the
+explanation from the scan.
 
-**Prefer behaviour to literals, and remember a count cannot see a name.**
-`tests/test_unit_conversions_agree.py` converts values rather than
-comparing constants, because keeping the constant and flipping the
-operation is the likelier mistake. `tests/test_readme_names_real_tools.py`
-exists because the count guard beside it cannot tell a correct total
-from a table naming a tool nobody wrote.
+**Prefer behaviour to literals, and remember a count cannot see a name.** A
+behavioural conversion test is stronger than two constants that can drift in
+the same way. A tool-count test is not enough to prove documentation names real
+tools, which is why this repository also carries name-resolution guards.
+
+The security-policy version guard follows the same rule: bumping the package
+minor line without updating `SECURITY.md` must fail CI rather than silently
+publishing stale support information.
 
 ## Pull requests
 
-- Keep PRs focused. One concern per PR.
-- Include a clear description of the problem and the chosen approach.
-- If you touch Pascal: remember that Altium caches scripts. Reviewers will
-  need to restart Altium to see your changes in effect.
+- Keep PRs focused. One concern per PR when practical.
+- Include a clear description of the problem, chosen approach, and safety
+  implications.
+- State the affected backend(s): Altium, KiCad, EasyEDA Pro, or backend-neutral.
 - Add or update tests when behaviour changes.
-- Run `pytest --ignore=tests/integration` locally before requesting review.
+- Keep public tool names/schemas backward compatible unless the PR explicitly
+  documents a breaking change.
+- If you touch Pascal, remember that Altium caches scripts; live reviewers must
+  reload/restart before verifying the change.
+- If you touch release/build logic, the package-artifact job must pass from a
+  clean wheel, not just an editable checkout.
+
+The pull-request template contains the current delivery checklist and should be
+completed rather than deleted for substantial changes.
 
 ## Commit messages
 
-Write the subject as a plain imperative sentence saying what the commit
-changes, wrapping the body at ~72 columns:
+Write the subject as a plain imperative sentence saying what the commit changes,
+wrapping the body at about 72 columns:
 
-```
+```text
 Keep the test suite away from the machine-global workspace pointer
 
 Longer body if needed: what was wrong, and why this is the fix.
 ```
 
-Do not use a `type(scope):` prefix. This file previously documented that
-convention; the repository no longer uses it.
-
-Do not write housekeeping messages. Mechanical tidying goes into the
-commit that makes the substantive change, and is not mentioned in it.
+Do not use a `type(scope):` prefix. Do not create standalone housekeeping
+commits when the cleanup is an inseparable part of the substantive change.
 
 ## Reporting bugs
 
-See [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md).
-Include the Altium version, the `eda-agent --version` output, and, if you
-can, the contents of the workspace `response.json` from the failing call.
+Use [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md)
+when Issues are enabled. Include the selected backend, `eda-agent --version`,
+Python/OS information, the EDA application/version, MCP client, and the smallest
+redacted backend-specific diagnostic that reproduces the failure.
+
+Security-sensitive reports must follow [`SECURITY.md`](SECURITY.md) instead of a
+public issue.
 
 ## Suggesting features
 
-See [`.github/ISSUE_TEMPLATE/feature_request.md`](.github/ISSUE_TEMPLATE/feature_request.md).
-Concrete use cases beat speculative API additions.
+Use [`.github/ISSUE_TEMPLATE/feature_request.md`](.github/ISSUE_TEMPLATE/feature_request.md)
+when Issues are enabled, or carry the same information into a focused PR when
+they are not. Concrete workflows, the target backend, relevant vendor/API
+surface, and safety requirements are more useful than speculative tool names.
