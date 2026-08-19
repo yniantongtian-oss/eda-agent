@@ -24,8 +24,9 @@ release-candidate commit must have all three jobs green:
 2. **Python 3.12** — the same gate on the second advertised Python runtime.
 3. **Package** — build the actual wheel and source distribution, verify package
    metadata and required files, install the wheel into a clean virtual
-   environment, exercise the shipped `eda-agent` console entry point, generate
-   SHA-256 checksums, and upload the verified artifacts.
+   environment, exercise the shipped console entry points, build the EasyEDA
+   `.eext` from the installed wheel, generate SHA-256 checksums, and upload the
+   verified artifacts.
 
 A failure in any one of these jobs blocks delivery. Do not waive a failing gate
 by deleting or skipping the check. Fix the source, packaging, documentation, or
@@ -37,17 +38,19 @@ A successful package job uploads one immutable Actions artifact named
 `eda-agent-dist-<commit-sha>` containing:
 
 - the `.whl` built from that commit;
-- the `.tar.gz` source distribution built from that commit; and
-- `SHA256SUMS.txt` with the SHA-256 digest of both files.
+- the `.tar.gz` source distribution built from that commit;
+- `eda-agent-bridge.eext`, built by the EasyEDA helper installed from that
+  wheel; and
+- `SHA256SUMS.txt` with the SHA-256 digest of all three deliverable files.
 
 `scripts/verify_distribution.py` additionally checks that the wheel contains
-its metadata, `eda-agent` console entry point, LICENSE, NOTICE, and the bundled
-Altium DelphiScript project files, and that the sdist contains the expected
-source/release files.
+its metadata, both console entry points, LICENSE, NOTICE, the bundled Altium
+DelphiScript project, and the complete EasyEDA extension source/build payload.
+The sdist must contain the corresponding source/release files as well.
 
-To verify a downloaded bundle, compute SHA-256 for the wheel and sdist and
-compare the lowercase hexadecimal values with `SHA256SUMS.txt` before
-installation.
+To verify a downloaded bundle, compute SHA-256 for the wheel, sdist, and `.eext`
+and compare the lowercase hexadecimal values with `SHA256SUMS.txt` before
+installation/import.
 
 ## Clean-install acceptance
 
@@ -58,11 +61,18 @@ not the source checkout. The following must succeed from that installed wheel:
 eda-agent --version
 eda-agent --help
 eda-agent scripts-path
+eda-agent-easyeda-extension path
+eda-agent-easyeda-extension build --dest <writable-directory>
 ```
 
-The path returned by `scripts-path` must exist. This proves the installed
-console script and packaged Altium script payload are reachable after an actual
-wheel installation.
+The path returned by `scripts-path` must exist. The EasyEDA source path must also
+exist, and the build command must create a non-empty `eda-agent-bridge.eext` in
+the writable destination. This proves both editor-side payloads are reachable
+from an actual wheel installation rather than only from the repository checkout.
+
+The EasyEDA build intentionally uses the canonical `extensions/easyeda/build.py`
+logic and therefore requires Node.js for its function-body parse validation. CI
+runs that exact build path before publishing the `.eext` artifact.
 
 ## Live EDA acceptance boundary
 
@@ -96,11 +106,12 @@ KiCad version and the commands exercised in the delivery notes.
 
 ### EasyEDA Pro
 
-For a delivery that depends on EasyEDA Pro, import the shipped extension, enable
-external interaction, open the relevant design document, connect to the local
-loopback bridge, and exercise the exact commands needed by the handoff. Respect
-the backend’s per-command `verified_live` reporting; a successful connection is
-not evidence that every API command was live-verified.
+For a delivery that depends on EasyEDA Pro, import the shipped
+`eda-agent-bridge.eext`, enable external interaction, open the relevant design
+document, connect to the local loopback bridge, and exercise the exact commands
+needed by the handoff. Respect the backend’s per-command `verified_live`
+reporting; a successful connection is not evidence that every API command was
+live-verified.
 
 See [`BACKENDS.md`](BACKENDS.md) for backend-specific limitations and safety
 behavior.
