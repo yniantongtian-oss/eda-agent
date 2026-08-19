@@ -60,22 +60,37 @@ This is **not** a batch tool that opens a project, runs a script, and exits. It'
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.11 or 3.12 (both are continuously tested by this fork's CI)
 - An EDA tool, one of:
   - **Altium Designer** (recent versions, AD20+ preferred) - Windows only
   - **KiCad 9+** with the IPC API server enabled (Preferences → Plugins → KiCad API server), plus `pip install -e .[kicad]`
+  - **EasyEDA Pro** with external interaction enabled and the shipped `eda-agent-bridge.eext` extension imported
+- **Node.js** only when rebuilding the EasyEDA `.eext`; the verified CI delivery artifact already contains the built extension
 
 The server picks a backend at startup (`EDA_AGENT_BACKEND`, default `altium`), so one install drives any of them. See [EDA backends](#eda-backends).
 
 ## Installation
 
+This repository is a maintained fork of `salitronic/eda-agent`. Upstream authorship and project provenance are preserved, while this fork adds release/package verification and delivery hardening. Clone **this repository** when you want the exact source that its CI verifies:
+
 ```bash
-git clone https://github.com/salitronic/eda-agent
+git clone https://github.com/yniantongtian-oss/eda-agent
 cd eda-agent
 pip install -e .
 ```
 
 Register the server with your MCP client. The binary is `eda-agent` and runs on stdio; consult your client's docs for how to add a local stdio-based server.
+
+### Verified CI delivery
+
+For a handoff, prefer the artifact produced by the latest successful `tests` workflow for the exact commit you are delivering. The package job publishes one immutable artifact named `eda-agent-dist-<commit-sha>` containing:
+
+- the verified Python wheel;
+- the matching source distribution;
+- a ready-to-import `eda-agent-bridge.eext` for EasyEDA Pro; and
+- `SHA256SUMS.txt` covering all three deliverable files.
+
+The package job builds the real wheel/sdist, verifies metadata and required payloads, installs the wheel into a clean virtual environment, exercises the shipped CLIs, builds the EasyEDA extension from that installed wheel, computes checksums, and only then uploads the artifact. See [`docs/DELIVERY_ACCEPTANCE.md`](docs/DELIVERY_ACCEPTANCE.md) for the acceptance boundary and the live-editor checks that CI cannot replace.
 
 ### Claude Code
 
@@ -116,6 +131,24 @@ From then on, every Altium startup compiles the script project and the polling l
 2. Expand `Altium_API` → `Dispatcher.pas`, select **StartMCPServer**, click **Run**
 
 The polling loop starts and your MCP client can drive Altium.
+
+### EasyEDA Pro extension
+
+The verified CI artifact already contains `eda-agent-bridge.eext`; import that file from **Settings > Extensions** in EasyEDA Pro.
+
+If you installed the wheel separately and want to rebuild the extension from the payload inside that wheel:
+
+```bash
+eda-agent-easyeda-extension build --dest easyeda-extension
+```
+
+Then import:
+
+```text
+easyeda-extension/eda-agent-bridge.eext
+```
+
+Use `eda-agent-easyeda-extension path` to locate the bundled source/build payload. Rebuilding requires Node.js because the canonical build validates the generated entry using EasyEDA's function-body parse shape.
 
 ## EDA backends
 
@@ -287,7 +320,7 @@ Some tool paths trigger DelphiScript compile or runtime errors ("Undeclared iden
 
 **Recovery:** in Altium Designer, open the script project tab and press the **red Stop** button in the Script IDE toolbar (equivalently **Run > Stop** from the menu, or **Ctrl+F3**; use **Ctrl+Pause/Break** if the script is stuck in an infinite loop). This stops the halted debugger. Then re-launch the polling loop via **File > Run Script... > StartMCPServer > Run**.
 
-This is an ongoing reliability effort. Every identified crash is either fixed or guarded. If you hit a new one, the Altium error dialog tells you the exact identifier or line. Opening an issue with that text helps us harden the relevant path.
+This is an ongoing reliability effort. Every identified crash is either fixed or guarded. If you hit a new one, the Altium error dialog tells you the exact identifier or line. Include that text in a bug report through the repository's configured support channel so the relevant path can be hardened.
 
 ### Projects on a UNC network path do not open
 
@@ -415,6 +448,8 @@ All intelligence lives in Python. The DelphiScript side is a pass-through layer 
 | `eda-agent --no-dashboard` / `eda-agent --headless` | MCP server only, no web dashboard. Required by strict-stdio MCP clients (Codex, etc) that can't tolerate the dashboard thread. Also via env var: `EDA_AGENT_DISABLE_DASHBOARD=1` or `EDA_AGENT_HEADLESS=1`. |
 | `eda-agent scripts-path` | Print path to bundled DelphiScript sources |
 | `eda-agent install-scripts [--dest PATH] [--force]` | Copy scripts to a directory of your choice |
+| `eda-agent-easyeda-extension path` | Print the EasyEDA extension source/build payload bundled with the installed wheel (or the source tree under an editable install) |
+| `eda-agent-easyeda-extension build [--dest PATH] [--force]` | Copy that payload to a writable directory and build `eda-agent-bridge.eext`; requires Node.js for the canonical parse validation |
 | `eda-agent review --offline <file> [--json/--sarif] [--fail-on ...]` | **Offline** component-level design review of a `.SchDoc`/`.PrjPcb` (no Altium). Opt-in (`--offline` or `EDA_AGENT_HEADLESS_REVIEW=1`); exit 1 on findings at/above `--fail-on` - a hardware-CI gate |
 | `eda-agent bom --offline <file> [--csv/--json]` | **Offline** consolidated BOM from a `.SchDoc`/`.PrjPcb` (no Altium). Opt-in |
 | `eda-agent netlist --offline <file> [--json] [--fail-on ...]` | **Offline** geometric netlist reconstruction + connectivity ERC (`single_pin_net`, `net_short`) from a `.SchDoc` (no Altium). Opt-in; exit 1 on findings at/above `--fail-on` |
@@ -435,10 +470,11 @@ Coordinates throughout the API are in **mils** (1 mil = 0.0254 mm).
 
 ```bash
 pip install -e ".[dev]"
+python -m compileall -q src tests scripts
 python -m pytest tests/ -q
 ```
 
-The test suite includes a Python Altium simulator for end-to-end integration tests, Free Pascal cross-validation that runs the actual DelphiScript functions against Python mirrors, and a regression suite for previously encountered edge cases.
+The test suite includes a Python Altium simulator for end-to-end integration tests, Free Pascal cross-validation that runs the actual DelphiScript functions against Python mirrors, and a regression suite for previously encountered edge cases. CI runs both advertised Python versions and a separate package job that validates the real release artifacts.
 
 Rebuild the monolithic DelphiScript file after editing sources under `scripts/altium/`:
 
@@ -452,20 +488,23 @@ python build.py
 ```
 eda-agent/
 ├── src/eda_agent/          Python package
-│   ├── bridge/             Altium communication layer
+│   ├── bridge/             EDA communication layers
 │   ├── schemas/            Pydantic IPC envelope + per-command schemas
 │   ├── tools/              MCP tool implementations (incl. design.py)
 │   ├── design/             Design agent: plan / inventory / discipline / executor / validator
 │   ├── diag/               Health and doctor checks
+│   ├── easyeda_extension_cli.py  EasyEDA extension delivery helper
 │   ├── cli.py              CLI subcommands
 │   └── server.py           MCP server entry point
 ├── scripts/altium/         DelphiScript sources (dev source of truth)
 │   ├── Main.pas, Utils.pas, Dispatcher.pas, …
 │   └── Altium_API.PrjScr   Altium script project
+├── extensions/easyeda/     EasyEDA Pro extension source + canonical builder
+├── docs/                   Backend, release verification and delivery acceptance docs
 └── tests/                  Python + Free Pascal test suite
 ```
 
-At wheel build time `scripts/altium/` is copied into `src/eda_agent/scripts/` inside the wheel (via Hatchling `force-include`), so `eda-agent install-scripts` always finds the scripts.
+At wheel build time, Altium scripts are copied under `eda_agent/scripts/` and the EasyEDA source/build payload under `eda_agent/easyeda_extension/` using Hatchling `force-include`. That makes both editor-side payloads available from a real wheel install, not only from a source checkout.
 
 ## Troubleshooting
 
@@ -473,7 +512,7 @@ At wheel build time `scripts/altium/` is copied into `src/eda_agent/scripts/` in
 
 **"Script not responding" / MCP tools time out**: confirm the script project is loaded and `StartMCPServer` is running. Re-launch it via **File > Run Script... > StartMCPServer > Run**. Check `%USERPROFILE%\EDA Agent\workspace\` is writable.
 
-**Altium error dialog "Undeclared identifier: ..." or "Could not convert variant..."**: a DelphiScript crash in one of the bridge handlers. In Altium's Script IDE toolbar, press the red **Stop** button (or **Run > Stop** / **Ctrl+F3**; use **Ctrl+Pause/Break** if the script is stuck in an infinite loop) to halt the debugger. Then re-launch the polling loop via **File > Run Script... > StartMCPServer > Run**. Report the identifier or error text as an issue.
+**Altium error dialog "Undeclared identifier: ..." or "Could not convert variant..."**: a DelphiScript crash in one of the bridge handlers. In Altium's Script IDE toolbar, press the red **Stop** button (or **Run > Stop** / **Ctrl+F3**; use **Ctrl+Pause/Break** if the script is stuck in an infinite loop) to halt the debugger. Then re-launch the polling loop via **File > Run Script... > StartMCPServer > Run**. Report the identifier or error text through the repository's configured support channel.
 
 **Some Altium buttons don't respond while the server is running**: expected while the AI is actively issuing commands. Built-in Altium functions that depend on DelphiScript wait for the polling loop to yield. The loop enters an idle/yield mode within ~1 s of the last AI command; if a button is still unresponsive after that, call `app_detach` from the MCP client to fully release the scripting engine.
 
@@ -485,10 +524,10 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Disclaimer
 
-**Use at your own risk.** `eda-agent` drives Altium Designer programmatically and can modify, save, or delete design data. An AI client operating it can issue rapid, irreversible changes. Before using this tool on any design:
+**Use at your own risk.** `eda-agent` drives EDA applications programmatically and can modify, save, or delete design data. An AI client operating it can issue rapid, irreversible changes. Before using this tool on any design:
 
-- **Back up your project.** Commit to version control, copy the folder elsewhere, or both. Do not rely solely on Altium's own history.
-- Expect the possibility of **data loss, corrupted documents, or Altium crashes**, especially on large boards, unusual object configurations, or untested API paths.
+- **Back up your project.** Commit to version control, copy the folder elsewhere, or both. Do not rely solely on an EDA application's own history.
+- Expect the possibility of **data loss, corrupted documents, or application crashes**, especially on large designs, unusual object configurations, or untested API paths.
 - Review automated changes before saving. Prefer working on a branch or a copy until you have trust in a given workflow.
 
 This software is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not liable for any damage to your designs, projects, data, or installation.
