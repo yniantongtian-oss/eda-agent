@@ -81,10 +81,10 @@ Issues = "https://github.com/salitronic/eda-agent/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/eda_agent"]
-# The .pas / .PrjScr files are not recognised as Python package data by
-# default -- force-include them explicitly. The scripts/altium/ tree stays
-# on disk as the dev source of truth; the wheel gets a copy under
-# eda_agent/scripts/ so `eda-agent install-scripts` can find it.
+# Non-Python runtime payloads are force-included explicitly. Altium receives
+# the DelphiScript project under eda_agent/scripts/. EasyEDA receives the
+# complete extension source/build payload under eda_agent/easyeda_extension/
+# so a wheel install still contains the editor half required to connect.
 exclude = [
     "**/__pycache__",
     "**/*.pyc",
@@ -107,6 +107,13 @@ exclude = [
 "scripts/altium/Dispatcher.pas" = "eda_agent/scripts/Dispatcher.pas"
 "scripts/altium/SelfTest.pas" = "eda_agent/scripts/SelfTest.pas"
 "scripts/altium/Altium_API.PrjScr" = "eda_agent/scripts/Altium_API.PrjScr"
+"extensions/easyeda/BUILD_STAMP.json" = "eda_agent/easyeda_extension/BUILD_STAMP.json"
+"extensions/easyeda/README.md" = "eda_agent/easyeda_extension/README.md"
+"extensions/easyeda/build.py" = "eda_agent/easyeda_extension/build.py"
+"extensions/easyeda/capabilities.json" = "eda_agent/easyeda_extension/capabilities.json"
+"extensions/easyeda/extension.json" = "eda_agent/easyeda_extension/extension.json"
+"extensions/easyeda/iframe_template.html" = "eda_agent/easyeda_extension/iframe_template.html"
+"extensions/easyeda/main.js" = "eda_agent/easyeda_extension/main.js"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -114,8 +121,16 @@ include = [
     "scripts/altium/*.pas",
     "scripts/altium/*.dfm",
     "scripts/altium/*.PrjScr",
+    "extensions/easyeda/BUILD_STAMP.json",
+    "extensions/easyeda/README.md",
+    "extensions/easyeda/build.py",
+    "extensions/easyeda/capabilities.json",
+    "extensions/easyeda/extension.json",
+    "extensions/easyeda/iframe_template.html",
+    "extensions/easyeda/main.js",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "pyproject.toml",
 ]
 exclude = [
