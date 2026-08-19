@@ -62,7 +62,7 @@ jobs:
   package:
     # A green editable install is not enough for a release. Build the actual
     # wheel + sdist, inspect their contents, install the wheel into a clean
-    # venv, and exercise the shipped console entry point.
+    # venv, and exercise the shipped console entry points.
     runs-on: windows-latest
     timeout-minutes: 30
 
@@ -85,7 +85,7 @@ jobs:
       - name: Verify distribution contents and metadata
         run: python scripts/verify_distribution.py
 
-      - name: Smoke-test installed wheel
+      - name: Smoke-test installed wheel and build EasyEDA extension
         shell: pwsh
         run: |
           $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
@@ -101,14 +101,26 @@ jobs:
             throw "Bundled Altium scripts path does not exist: $scriptsPath"
           }
 
+          $easyedaSource = & .\.venv-smoke\Scripts\eda-agent-easyeda-extension.exe path
+          if (-not (Test-Path $easyedaSource)) {
+            throw "Bundled EasyEDA extension source path does not exist: $easyedaSource"
+          }
+
+          .\.venv-smoke\Scripts\eda-agent-easyeda-extension.exe build --dest .easyeda-smoke
+          $eext = (Get-ChildItem .easyeda-smoke\*.eext | Select-Object -First 1).FullName
+          if (-not $eext) { throw "EasyEDA extension build produced no .eext file" }
+          Copy-Item $eext dist\eda-agent-bridge.eext
+
       - name: Write SHA-256 checksums
         shell: pwsh
         run: |
-          $lines = Get-ChildItem dist\*.whl, dist\*.tar.gz | Sort-Object Name | ForEach-Object {
+          $lines = Get-ChildItem dist\*.whl, dist\*.tar.gz, dist\*.eext | Sort-Object Name | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
           }
-          if (-not $lines) { throw "No release artifacts available for checksumming" }
+          if ($lines.Count -ne 3) {
+            throw "Expected exactly wheel, sdist, and EasyEDA .eext for checksumming; got $($lines.Count)"
+          }
           $lines | Set-Content -Path dist\SHA256SUMS.txt -Encoding ascii
           Get-Content dist\SHA256SUMS.txt
 
@@ -119,6 +131,7 @@ jobs:
           path: |
             dist/*.whl
             dist/*.tar.gz
+            dist/*.eext
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
