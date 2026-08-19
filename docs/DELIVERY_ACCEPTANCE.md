@@ -18,11 +18,11 @@ a different checkout and call it the same verified artifact.
 The `tests` GitHub Actions workflow is the automated source of truth. A
 release-candidate commit must have all three jobs green:
 
-1. **Python 3.11** — editable development install, whole-tree Python bytecode
+1. **Python 3.11**: editable development install, whole-tree Python bytecode
    compilation, DelphiScript lint, Pascal bundle consistency, Free Pascal
    cross-validation, and the complete pytest suite.
-2. **Python 3.12** — the same gate on the second advertised Python runtime.
-3. **Package** — build the actual wheel and source distribution, verify package
+2. **Python 3.12**: the same gate on the second advertised Python runtime.
+3. **Package**: build the actual wheel and source distribution, verify package
    metadata and required files, install the wheel into a clean virtual
    environment, exercise the shipped console entry points, build the EasyEDA
    `.eext` from the installed wheel, generate SHA-256 checksums, and upload the
