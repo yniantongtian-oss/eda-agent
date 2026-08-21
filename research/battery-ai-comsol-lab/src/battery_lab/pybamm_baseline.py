@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-import subprocess
 from typing import Any
 
 import numpy as np
