@@ -1,0 +1,4 @@
+base_config: configs/lfp_graphite_baseline.yaml
+c_rates: [0.5, 1.0, 2.0]
+ambient_temperatures_K: [298.15]
+output_root: runs/lfp_crate_sweep
