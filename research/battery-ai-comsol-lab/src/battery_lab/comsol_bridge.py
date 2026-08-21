@@ -64,7 +64,7 @@ class ComsolSession:
             finally:
                 self.model = None
 
-    def __enter__(self) -> "ComsolSession":
+    def __enter__(self) -> ComsolSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
