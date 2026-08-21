@@ -12,7 +12,6 @@ import pybamm
 
 from .schema import SimulationManifest, load_yaml
 
-
 MODEL_MAP = {
     "SPM": pybamm.lithium_ion.SPM,
     "SPMe": pybamm.lithium_ion.SPMe,
