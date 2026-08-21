@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,7 +21,7 @@ class SimulationManifest(BaseModel):
     parameter_set_id: str
     geometry_id: str | None = None
     protocol_id: str
-    created_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at_utc: datetime = Field(default_factory=lambda: datetime.now(UTC))
     commit_sha: str | None = None
     config_path: str | None = None
     status: Literal["created", "running", "completed", "failed"] = "created"
