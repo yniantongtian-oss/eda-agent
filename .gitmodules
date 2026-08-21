@@ -1,0 +1,18 @@
+[submodule "external/comsol-ai/comsol-multiphysics-mcp"]
+	path = external/comsol-ai/comsol-multiphysics-mcp
+	url = https://github.com/wjc9011/COMSOL_Multiphysics_MCP.git
+[submodule "external/comsol-ai/mph"]
+	path = external/comsol-ai/mph
+	url = https://github.com/MPh-py/MPh.git
+[submodule "external/comsol-ai/sim-cli"]
+	path = external/comsol-ai/sim-cli
+	url = https://github.com/svd-ai-lab/sim-cli.git
+[submodule "external/comsol-ai/sim-plugin-comsol"]
+	path = external/comsol-ai/sim-plugin-comsol
+	url = https://github.com/svd-ai-lab/sim-plugin-comsol.git
+[submodule "external/comsol-ai/deep-learning-topology-opt"]
+	path = external/comsol-ai/deep-learning-topology-opt
+	url = https://github.com/deng-cy/deep_learning_topology_opt.git
+[submodule "external/comsol-ai/ai-mag"]
+	path = external/comsol-ai/ai-mag
+	url = https://github.com/ethz-pes/AI-mag.git
