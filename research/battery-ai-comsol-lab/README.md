@@ -2,7 +2,7 @@
 
 A research-grade battery modeling, simulation, experiment, and AI workspace designed to connect **COMSOL Multiphysics**, **PyBaMM**, electrochemical experiments, machine learning, optimization, BMS algorithms, and digital-twin workflows.
 
-> Status: initial research architecture. The project is intentionally model- and chemistry-agnostic, with an LFP/graphite Li-ion cell as the first reproducible baseline.
+> Status: initial research architecture. The project is intentionally model- and chemistry-agnostic. It starts with a reproducible LFP/graphite electrochemical baseline and a separate LG M50 electro-thermal reference so thermal studies do not silently borrow unsupported properties.
 
 ## Research objective
 
@@ -18,7 +18,7 @@ The repository is organized so each layer can be used independently, while shari
 2. **Thermal behavior** — lumped, 2D/3D heat generation and conduction, cooling boundary conditions, anisotropic thermal properties.
 3. **Mechanical coupling** — electrode swelling, diffusion-induced stress, casing constraint, contact/pressure effects.
 4. **Ageing and degradation** — SEI growth, lithium plating, loss of active material, porosity change, resistance growth, calendar/cycle ageing.
-5. **Safety / thermal runaway** — abuse-condition studies, heat-source escalation, propagation-oriented pack studies, with safety-first experimental boundaries.
+5. **Safety / thermal runaway** — prevention, detection, conservative heat-source and propagation-oriented modeling with safety-first experimental boundaries.
 6. **AI and surrogate models** — SOH/RUL, reduced-order surrogates, PINN/operator-learning experiments, Bayesian optimization, uncertainty quantification.
 7. **BMS and digital twin** — SOC/SOH estimation, model adaptation, parameter tracking, fault indicators, state synchronization with measured data.
 8. **Pack/system studies** — electrical interconnects, cell variation, thermal gradients, cooling topology, module/pack observability.
@@ -45,7 +45,8 @@ battery-ai-comsol-lab/
    ├─ 05-data-standard.md
    ├─ 06-roadmap.md
    ├─ 07-bms-digital-twin.md
-   └─ 08-safety-thermal-runaway.md
+   ├─ 08-safety-thermal-runaway.md
+   └─ 09-reference-stack.md
 ```
 
 ## Recommended model ladder
@@ -62,18 +63,17 @@ Do not start every question with a full 3D multiphysics solve. Use the cheapest 
 | L5 | 2D/3D COMSOL multiphysics | geometry, tabs, cooling, local gradients, mechanics |
 | L6 | validated surrogate / ROM | optimization, real-time digital twin, large sweeps |
 
-## First baseline
+## Reproducible physics baselines
 
-The first baseline is a **single Li-ion LFP/graphite cell** with:
+### A. LFP/graphite electrochemical baseline
 
-- constant-current discharge and charge,
-- ambient-temperature sweep,
-- C-rate sweep,
-- DFN voltage/temperature outputs,
-- an explicit parameter/configuration file,
-- experiment IDs and metadata compatible with later COMSOL comparison.
+`configs/lfp_graphite_baseline.yaml` uses PyBaMM `Prada2013` with an isothermal DFN. This is deliberate: the parameter set is useful for an A123-style LFP electrochemical reference but does not provide a complete thermal-property set. The associated C-rate sweep is `configs/lfp_crate_sweep.yaml`.
 
-LFP is only the default reproducible baseline. The data and model contracts should also support NMC/graphite, NCA/graphite, LTO systems and future solid-state studies.
+### B. LG M50 electro-thermal reference
+
+`configs/lgm50_electrothermal_baseline.yaml` uses PyBaMM `ORegan2022` with DFN + lumped thermal physics. The source parameterization was developed for thermal-electrochemical modeling of a high-energy cylindrical LG M50 cell. The C-rate × temperature sweep is `configs/lgm50_crate_temperature_sweep.yaml`.
+
+Neither baseline is a specification for the actual cell you may later test. Real-cell comparison requires measured or otherwise validated geometry, electrochemical, thermal and operating-limit data.
 
 ## Environment
 
@@ -97,13 +97,27 @@ pip install -e .[comsol]
 
 A valid COMSOL installation/license is still required. The Python wrapper does not redistribute COMSOL.
 
-## Quick start: physics baseline
+## Quick start
+
+LFP electrochemical baseline:
 
 ```bash
-python -m battery_lab.pybamm_baseline --config configs/lfp_graphite_baseline.yaml --out runs/baseline
+battery-pybamm --config configs/lfp_graphite_baseline.yaml --out runs/lfp_baseline
 ```
 
-The baseline runner is designed to export tidy CSV plus a JSON manifest containing the exact input config, model choice, timestamps and software metadata.
+Electro-thermal baseline:
+
+```bash
+battery-pybamm --config configs/lgm50_electrothermal_baseline.yaml --out runs/lgm50_thermal
+```
+
+C-rate × temperature sweep:
+
+```bash
+battery-sweep --config configs/lgm50_crate_temperature_sweep.yaml
+```
+
+Each run exports tidy CSV plus a JSON manifest containing the exact input config, model choice, timestamps and software metadata.
 
 ## Research discipline
 
