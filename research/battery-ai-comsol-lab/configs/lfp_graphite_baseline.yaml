@@ -3,7 +3,7 @@ chemistry: LFP_graphite
 cell_format: generic
 engine: pybamm
 model: DFN
-thermal: lumped
+thermal: isothermal
 parameter_set: Prada2013
 protocol_id: constant_current_discharge
 c_rate: 1.0
@@ -12,6 +12,8 @@ initial_soc: 1.0
 max_duration_s: 7200
 output_points: 500
 notes: >-
-  Generic research baseline using an upstream PyBaMM parameter set. It is not a
-  specification for any commercial cell. Replace the parameter set and limits
-  with validated values before comparing to a real cell.
+  Generic LFP/graphite electrochemical baseline using the upstream Prada2013
+  parameter set. This parameter set is used here isothermally because it does
+  not provide a complete thermal-property set. It is not a specification for
+  any commercial cell. Replace parameters and operating limits with validated
+  values before comparing to a real cell.
