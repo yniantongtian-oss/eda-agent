@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+runs/
+results/
+artifacts/
+
+# Battery datasets are managed by manifest / LFS / external storage.
+data/raw/
+data/validated/
+data/processed/
+data/features/
+data/external/
+
+# COMSOL binaries and heavy exports should use LFS/external artifacts.
+comsol/models/*.mph
+comsol/exports/*.mph
+*.mph.lock
+
+# Local research scratch
+.ipynb_checkpoints/
+*.tmp
+*.bak
