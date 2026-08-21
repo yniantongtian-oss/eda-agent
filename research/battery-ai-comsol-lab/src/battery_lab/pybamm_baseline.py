@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,9 @@ def build_model(config: dict[str, Any]) -> pybamm.BaseModel:
     try:
         model_cls = MODEL_MAP[model_name]
     except KeyError as exc:
-        raise ValueError(f"Unsupported model {model_name!r}; choose one of {sorted(MODEL_MAP)}") from exc
+        raise ValueError(
+            f"Unsupported model {model_name!r}; choose one of {sorted(MODEL_MAP)}"
+        ) from exc
 
     thermal = str(config.get("thermal", "lumped"))
     return model_cls(options={"thermal": thermal})
@@ -102,7 +104,7 @@ def run(config_path: str | Path, out_dir: str | Path) -> tuple[Path, Path]:
     csv_path = out_dir / "timeseries.csv"
     frame.to_csv(csv_path, index=False)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     manifest = SimulationManifest(
         simulation_id=f"pybamm_{stamp}",
         engine="pybamm",
