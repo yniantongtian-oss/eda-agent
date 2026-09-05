@@ -92,7 +92,15 @@ def write_workspace_pointer(workspace_dir: Path) -> None:
         path_str = str(workspace_dir)
         if not path_str.endswith("\\"):
             path_str += "\\"
-        target.write_text(path_str, encoding="mbcs")
+        encoding = "mbcs"
+        try:
+            import codecs
+            codecs.lookup(encoding)
+        except LookupError:
+            # Non-Windows hosts (and some CI images) lack mbcs; utf-8
+            # keeps override-path tests and WSL scratch writes working.
+            encoding = "utf-8"
+        target.write_text(path_str, encoding=encoding)
     except (OSError, PermissionError, UnicodeEncodeError, LookupError):
         # LookupError: "mbcs" only exists on Windows; the pointer file is
         # meaningless elsewhere anyway.

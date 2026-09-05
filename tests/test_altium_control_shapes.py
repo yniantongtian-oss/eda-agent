@@ -131,6 +131,13 @@ def test_a_control_with_no_caption_is_not_a_button():
 # Pressing them.
 # --------------------------------------------------------------------
 
+class _Win32Con:
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    MK_LBUTTON = 0x0001
+    BM_CLICK = 0x00F5
+
+
 class _Recorder:
     """Captures which Win32 message a press would send."""
 
@@ -149,6 +156,7 @@ class _Recorder:
 def recorder(monkeypatch):
     rec = _Recorder()
     monkeypatch.setattr(w, "win32gui", rec, raising=False)
+    monkeypatch.setattr(w, "win32con", _Win32Con, raising=False)
     monkeypatch.setattr(w, "_AVAILABLE", True)
     return rec
 
@@ -158,23 +166,19 @@ def test_a_vcl_button_is_pressed_with_mouse_messages(recorder):
 
     Measured live: the press returned cleanly and the ECO stayed open.
     """
-    import win32con
-
     w.click(_control("TXPBitBtn", "Close"))
 
-    assert recorder.posted == [win32con.WM_LBUTTONDOWN,
-                               win32con.WM_LBUTTONUP], (
+    assert recorder.posted == [_Win32Con.WM_LBUTTONDOWN,
+                               _Win32Con.WM_LBUTTONUP], (
         "a VCL button needs a posted down/up pair; BM_CLICK is ignored")
-    assert win32con.BM_CLICK not in recorder.sent
+    assert _Win32Con.BM_CLICK not in recorder.sent
 
 
 def test_a_stock_button_still_gets_bm_click(recorder):
     """The message-box path must not regress."""
-    import win32con
-
     w.click(_control("Button", "OK"))
 
-    assert recorder.sent == [win32con.BM_CLICK]
+    assert recorder.sent == [_Win32Con.BM_CLICK]
     assert recorder.posted == []
 
 

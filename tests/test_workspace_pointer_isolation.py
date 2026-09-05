@@ -64,7 +64,12 @@ def test_pointer_override_redirects_the_write(tmp_path, monkeypatch):
     write_workspace_pointer(workspace)
 
     assert scratch.exists()
-    written = scratch.read_text(encoding="mbcs").strip()
+    encoding = "mbcs"
+    try:
+        "x".encode(encoding)
+    except LookupError:
+        encoding = "utf-8"
+    written = scratch.read_text(encoding=encoding).strip()
     assert written == str(workspace) + "\\", (
         "pointer must hold the workspace path with a trailing separator"
     )
