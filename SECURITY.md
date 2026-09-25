@@ -108,3 +108,9 @@ Both are off by default; setting either changes nothing else.
 Read-only mode is enforced in the bridge, which every call to Altium passes
 through. Its classification mirrors `CommandIsReadOnly` in
 `scripts/altium/StatusForm.pas`, and a test fails if the two lists drift.
+
+## Fork-specific security scope
+
+This fork also ships or pins integration material that is not part of the upstream release boundary: the EasyEDA Pro extension packaging helper, distribution verification scripts, and the `external/comsol-ai/` submodules. Treat vulnerabilities in those fork-only paths as fork issues; vulnerabilities reproduced unchanged in upstream should also be coordinated with the upstream project.
+
+Do not expose the EasyEDA bridge, local dashboards, MCP stdio transport, Altium workspace IPC directory, or COMSOL automation endpoints to untrusted network clients. Submodule updates must be reviewed as supply-chain changes and should remain pinned to explicit commits.
