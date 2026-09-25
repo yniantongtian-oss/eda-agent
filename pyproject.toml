@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "eda-agent"
 version = "0.6.1"
-description = "MCP server for EDA tool automation, currently supports Altium Designer. Around 400 tools for schematic, PCB, and library ops via DelphiScript bridge."
+description = "MCP server for AI-assisted EDA automation across Altium Designer, KiCad, and EasyEDA Pro, with around 400 tools on the default Altium backend."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [
     { name = "George Saliba", email = "george.saliba@salitronic.com" }
 ]
-keywords = ["altium", "mcp", "pcb", "eda", "schematic"]
+keywords = ["altium", "kicad", "easyeda", "mcp", "model-context-protocol", "ai", "pcb", "eda", "schematic"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -82,6 +82,7 @@ web = [
 
 [project.scripts]
 eda-agent = "eda_agent.server:main"
+eda-agent-easyeda-extension = "eda_agent.easyeda_extension_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/salitronic/eda-agent"
@@ -116,6 +117,13 @@ exclude = [
 "scripts/altium/Dispatcher.pas" = "eda_agent/scripts/Dispatcher.pas"
 "scripts/altium/SelfTest.pas" = "eda_agent/scripts/SelfTest.pas"
 "scripts/altium/Altium_API.PrjScr" = "eda_agent/scripts/Altium_API.PrjScr"
+"extensions/easyeda/BUILD_STAMP.json" = "eda_agent/easyeda_extension/BUILD_STAMP.json"
+"extensions/easyeda/README.md" = "eda_agent/easyeda_extension/README.md"
+"extensions/easyeda/build.py" = "eda_agent/easyeda_extension/build.py"
+"extensions/easyeda/capabilities.json" = "eda_agent/easyeda_extension/capabilities.json"
+"extensions/easyeda/extension.json" = "eda_agent/easyeda_extension/extension.json"
+"extensions/easyeda/iframe_template.html" = "eda_agent/easyeda_extension/iframe_template.html"
+"extensions/easyeda/main.js" = "eda_agent/easyeda_extension/main.js"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -123,8 +131,16 @@ include = [
     "scripts/altium/*.pas",
     "scripts/altium/*.dfm",
     "scripts/altium/*.PrjScr",
+    "extensions/easyeda/BUILD_STAMP.json",
+    "extensions/easyeda/README.md",
+    "extensions/easyeda/build.py",
+    "extensions/easyeda/capabilities.json",
+    "extensions/easyeda/extension.json",
+    "extensions/easyeda/iframe_template.html",
+    "extensions/easyeda/main.js",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "pyproject.toml",
 ]
 exclude = [
