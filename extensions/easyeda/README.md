@@ -198,3 +198,14 @@ or remove work wholesale. All three refuse unless `confirm` is true, and
 **both halves check independently**: the extension is reachable by
 anything speaking this protocol, so it cannot assume a caller already
 checked.
+
+## Wheel-packaged extension in this fork
+
+This fork includes the complete EasyEDA extension build payload in the Python wheel and exposes a helper CLI:
+
+```bash
+eda-agent-easyeda-extension path
+eda-agent-easyeda-extension build --dest easyeda-extension
+```
+
+The first command locates the packaged read-only source payload. The second copies it to a writable destination, validates/builds it, and produces an importable `.eext`. Do not build in place inside `site-packages`. The fork's package CI performs the same installed-wheel build before publishing delivery artifacts; see [../../docs/DELIVERY_ACCEPTANCE.md](../../docs/DELIVERY_ACCEPTANCE.md).
