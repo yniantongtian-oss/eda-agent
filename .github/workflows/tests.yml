@@ -8,6 +8,9 @@ on:
 # A newer push makes an older run's answer worthless, and both compete
 # for the same runner. Superseded runs are cancelled so the queue is not
 # spent finishing work nobody will read.
+permissions:
+  contents: read
+
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
@@ -221,3 +224,79 @@ jobs:
           --ignore=tests/test_cross_validate.py
           --ignore=tests/test_pascal_runner.py
           --durations=25
+
+  package:
+    # Build the distributable artifacts rather than relying only on an editable install.
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build frontend
+        run: python -m pip install "build>=1.2,<2"
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Verify distribution contents and metadata
+        run: python scripts/verify_distribution.py
+
+      - name: Smoke-test installed wheel and build EasyEDA extension
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          if (-not $wheel) { throw "No wheel found in dist/" }
+
+          python -m venv .venv-smoke
+          .\.venv-smoke\Scripts\python.exe -m pip install $wheel
+          .\.venv-smoke\Scripts\eda-agent.exe --version
+          .\.venv-smoke\Scripts\eda-agent.exe --help | Out-Null
+
+          $scriptsPath = & .\.venv-smoke\Scripts\eda-agent.exe scripts-path
+          if (-not (Test-Path $scriptsPath)) {
+            throw "Bundled Altium scripts path does not exist: $scriptsPath"
+          }
+
+          $easyedaSource = & .\.venv-smoke\Scripts\eda-agent-easyeda-extension.exe path
+          if (-not (Test-Path $easyedaSource)) {
+            throw "Bundled EasyEDA extension source path does not exist: $easyedaSource"
+          }
+
+          .\.venv-smoke\Scripts\eda-agent-easyeda-extension.exe build --dest .easyeda-smoke
+          $eext = (Get-ChildItem .easyeda-smoke\*.eext | Select-Object -First 1).FullName
+          if (-not $eext) { throw "EasyEDA extension build produced no .eext file" }
+          Copy-Item $eext dist\eda-agent-bridge.eext
+
+      - name: Write SHA-256 checksums
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem dist\*.whl, dist\*.tar.gz, dist\*.eext | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          if ($lines.Count -ne 3) {
+            throw "Expected exactly wheel, sdist, and EasyEDA .eext for checksumming; got $($lines.Count)"
+          }
+          $lines | Set-Content -Path dist\SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eda-agent-dist-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.eext
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
