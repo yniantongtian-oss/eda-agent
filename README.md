@@ -1,5 +1,8 @@
 # eda-agent
 
+> **Fork integration note.** This fork tracks `salitronic/eda-agent` while adding verified wheel/sdist delivery, a wheel-packaged EasyEDA Pro extension helper, and a pinned COMSOL-AI ecosystem. Fork-specific delivery acceptance is documented in [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md) and the COMSOL integration inventory in [docs/comsol-ai-ecosystem.md](docs/comsol-ai-ecosystem.md).
+
+
 MCP server that lets an AI (or any MCP-compatible client) **interact with a live Altium Designer session**, with KiCad and EasyEDA Pro available as additional backends. It exposes around 400 tools on Altium, covering schematic, PCB, library, project, and design-agent operations, over a persistent DelphiScript bridge. The AI reads the design you currently have open, asks questions about it, and can modify it in place while you watch. The [backend](#eda-backends) is selected at startup, so each user sees only their own tool set.
 
 > **⚠️ Experimental.** Not all tools are extensively tested. Some can crash the Altium DelphiScript engine. See [Known limitations](#known-limitations) before using on any design you haven't backed up.
@@ -541,3 +544,15 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 This software is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not liable for any damage to your designs, projects, data, or installation.
 
 This project is not affiliated with, endorsed by, or sponsored by Altium Limited, the KiCad project, or EasyEDA. "Altium" and "Altium Designer" are trademarks of Altium Limited; "KiCad" and "EasyEDA" are trademarks of their respective owners. `eda-agent` is an independent community tool that interoperates with each of these applications through its own published API: Altium Designer via its scripting API, KiCad via its IPC API and command line, and EasyEDA Pro via its extension API.
+
+## Fork delivery extensions
+
+The fork CI additionally verifies the built Python distributions and the EasyEDA extension payload. After installing the fork wheel, the packaged extension can be materialized with:
+
+```bash
+eda-agent-easyeda-extension build --dest easyeda-extension
+```
+
+The resulting `.eext` can be imported into EasyEDA Pro. Release acceptance, checksums, and live-editor boundaries are documented in [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md).
+
+The repository also pins a small COMSOL/AI tool ecosystem as git submodules under `external/comsol-ai/`; see [docs/comsol-ai-ecosystem.md](docs/comsol-ai-ecosystem.md) before updating those pins.
