@@ -72,7 +72,7 @@ def test_the_roots_are_configurable_and_not_a_whole_drive_scan(monkeypatch):
     from eda_agent.libimport.providers import altium_local
 
     monkeypatch.setenv("EDA_AGENT_ALTIUM_LIBRARIES",
-                       os.pathsep.join(["A:/one", "B:/two"]))
+                       os.pathsep.join(["/libs/one", "/libs/two"]))
     roots = [str(r) for r in altium_local._roots()]
 
     assert len(roots) == 2

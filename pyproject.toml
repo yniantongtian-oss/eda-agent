@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "eda-agent"
 version = "0.6.1"
-description = "MCP server for AI-assisted EDA automation across Altium Designer, KiCad, and EasyEDA Pro, with around 400 tools on the default Altium backend."
+description = "MCP server for AI-assisted EDA automation across Altium Designer, KiCad, and EasyEDA Pro, with live and offline design tools."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -91,10 +91,10 @@ Issues = "https://github.com/salitronic/eda-agent/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/eda_agent"]
-# The .pas / .PrjScr files are not recognised as Python package data by
-# default -- force-include them explicitly. The scripts/altium/ tree stays
-# on disk as the dev source of truth; the wheel gets a copy under
-# eda_agent/scripts/ so `eda-agent install-scripts` can find it.
+# Non-Python runtime payloads are force-included explicitly. Altium receives
+# the DelphiScript project under eda_agent/scripts/. EasyEDA receives the
+# complete extension source/build payload under eda_agent/easyeda_extension/
+# so a wheel install still contains the editor half required to connect.
 exclude = [
     "**/__pycache__",
     "**/*.pyc",

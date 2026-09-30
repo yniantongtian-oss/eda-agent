@@ -42,10 +42,16 @@ def _altium_is_present(monkeypatch):
     which has nothing to do with whether an editor happens to be
     running, so the lookup is answered here and the decisions are what
     gets tested.
+
+    Also pretend Win32 UI bindings are available: these tests stub the
+    driver and only assert authorization flags, so a Linux CI host
+    without pywin32 should still exercise the wrapper decisions.
     """
     from eda_agent.tools import uiauto
+    from eda_agent.ui import windows
 
     monkeypatch.setattr(uiauto, "_altium_pid", lambda: (4242, None))
+    monkeypatch.setattr(windows, "available", lambda: True)
 
 
 @pytest.fixture

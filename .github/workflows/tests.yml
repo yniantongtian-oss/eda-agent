@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tests-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,9 +23,9 @@ jobs:
   cross-validate:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -135,10 +135,16 @@ jobs:
           }
 
   test:
-    # windows-latest matches the only supported runtime (the bridge drives
-    # Altium Designer on Windows); the offline engines are platform-neutral
-    # but there is no reason to certify a platform we never run on.
+    # Altium-specific bridge code needs Windows. Run the full suite on every
+    # Python version advertised by pyproject.toml so the compatibility claim
+    # is continuously verified instead of only being metadata.
     runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
     steps:
       # fetch-depth: 0 brings the tags along. The default shallow fetch
       # brings none, and tests/test_version_is_unreleased.py compares the
@@ -146,13 +152,14 @@ jobs:
       # compare and passes vacuously. That would leave the one check that
       # catches a release number which has already shipped inert in CI,
       # which is the only place it runs unattended.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -194,6 +201,9 @@ jobs:
       - name: Build the EasyEDA extension
         run: python extensions/easyeda/build.py
 
+      - name: Compile Python sources
+        run: python -m compileall -q src tests scripts
+
       - name: DelphiScript lint
         run: python scripts/altium/lint.py
 
@@ -227,16 +237,17 @@ jobs:
 
   package:
     # Build the distributable artifacts rather than relying only on an editable install.
+    needs: [test, cross-validate]
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -288,9 +299,10 @@ jobs:
             throw "Expected exactly wheel, sdist, and EasyEDA .eext for checksumming; got $($lines.Count)"
           }
           $lines | Set-Content -Path dist\SHA256SUMS.txt -Encoding ascii
+          Get-Content dist\SHA256SUMS.txt
 
       - name: Upload verified release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eda-agent-dist-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
