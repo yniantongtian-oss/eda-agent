@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Optional, Union
 
 from pydantic import ValidationError
@@ -384,7 +384,7 @@ def plan_from_live_sheet(
         "ok": True, "plan": None, "notes": [], "dropped_pins": [],
         "parts_read": 0, "nets_read": 0,
     }
-    if not project_path or not Path(project_path).name:
+    if not project_path or not PureWindowsPath(project_path).name:
         out["ok"] = False
         out["notes"].append(
             f"project_path must name a .PrjPcb file; got {project_path!r}")
@@ -397,11 +397,12 @@ def plan_from_live_sheet(
         return out
 
     scope = f"doc:{sheet_document}" if sheet_document else "active_doc"
-    sheet_name = (Path(sheet_document).stem if sheet_document else "main")
+    # Altium reports Windows paths even when the MCP host runs under WSL.
+    sheet_name = (PureWindowsPath(sheet_document).stem if sheet_document else "main")
     # A sheet this engine drew is named "<project stem>__<sheet>"; keep
     # the plan-side name it would have had so a re-emit lands on the
     # same document instead of a second one beside it.
-    stem = Path(project_path).stem
+    stem = PureWindowsPath(project_path).stem
     if sheet_name.startswith(f"{stem}__"):
         sheet_name = sheet_name[len(stem) + 2:]
 
@@ -519,8 +520,7 @@ def _sheet_size(
     if not isinstance(info, dict):
         return ""
     answered = str(info.get("file_path", "") or "")
-    if sheet_document and (
-            Path(answered).name.lower() != Path(sheet_document).name.lower()):
+    if sheet_document and PureWindowsPath(answered) != PureWindowsPath(sheet_document):
         out["notes"].append(
             f"sheet size not read: the document info came back for "
             f"{answered!r}, not the sheet asked for; the plan carries the "

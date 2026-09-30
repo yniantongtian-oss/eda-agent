@@ -500,6 +500,13 @@ def test_a_size_read_off_the_wrong_document_is_refused():
     assert any("not the sheet asked for" in n for n in out["notes"])
 
 
+def test_a_size_from_another_directory_with_the_same_sheet_name_is_refused():
+    sheet = _WithSize({"file_path": "C:/other/Legacy.SchDoc", "sheet_size": "A0"})
+    out = plan_from_live_sheet("p.PrjPcb", r"C:\x\Legacy.SchDoc", bridge=sheet)
+    assert out["plan"]["sheets"] == [{"name": "Legacy"}]
+    assert any("not the sheet asked for" in note for note in out["notes"])
+
+
 def test_a_size_the_layout_cannot_draw_is_said_rather_than_used():
     sheet = _WithSize({"file_path": "C:/x/Legacy.SchDoc",
                        "sheet_size": "OrCAD_C"})

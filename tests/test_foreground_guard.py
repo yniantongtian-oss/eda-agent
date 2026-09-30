@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -167,8 +168,11 @@ def test_disabling_stops_input_but_not_reading(monkeypatch):
     remove the checks that keep it safe.
     """
     monkeypatch.setenv(win.UI_AUTOMATION_ENV, "0")
+    monkeypatch.setattr(win, "_AVAILABLE", True)
+    monkeypatch.setattr(win, "win32gui", SimpleNamespace(
+        EnumWindows=lambda callback, context: None), raising=False)
     assert win.automation_enabled() is False
-    assert win.enumerate_windows() is not None
+    assert win.enumerate_windows() == []
 
     with pytest.raises(win.AutomationDisabled):
         win.send_keys("escape")
