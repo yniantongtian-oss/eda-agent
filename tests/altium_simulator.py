@@ -1580,9 +1580,15 @@ class AltiumSimulator:
             if not process_name:
                 return _build_error_response(rid, "MISSING_PARAMS",
                                              "process parameter is required")
+            # DISPATCHED, not success, mirroring Gen_RunProcess. Altium
+            # accepts an unknown process name without error, so the
+            # handler can only report that the command was sent. A
+            # simulator that answers "success" would teach a test to
+            # assert a key the live bridge never emits.
             return _build_success_response(
                 rid,
-                '{"success":true,"process":"' + _escape_json_string(process_name) + '"}'
+                '{"dispatched":true,"process":"'
+                + _escape_json_string(process_name) + '"}'
             )
         elif action == "get_font_spec":
             font_id = int(params.get("font_id", 1))

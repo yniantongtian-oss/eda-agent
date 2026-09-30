@@ -195,21 +195,67 @@ def test_every_object_type_the_docstrings_name_is_accepted():
     from tests.test_altium_no_raise import _TOOLS
 
     everything = _pascal_all()
-    sch = set(re.findall(r"TypeStr = '(e\w+)'",
+    # The chains compare against NORMALISED words now (lowercase, no
+    # separators, no leading "e"), so a caller writing "Sheet Symbol" or
+    # "sheetsymbol" resolves the same as "eSheetSymbol". Parsing the
+    # normalised form and normalising the docstring word is what keeps
+    # this checking the real relationship rather than the spelling.
+    sch = set(re.findall(r"N = '(\w+)'",
                          _function_body(everything, "ObjectTypeFromString")))
-    pcb = set(re.findall(r"TypeStr = '(e\w+)'",
+    pcb = set(re.findall(r"N = '(\w+)'",
                          _function_body(everything,
                                         "ObjectTypeFromStringPCB")))
     accepted = sch | pcb
     assert accepted, "no object types parsed out of the Pascal chains"
+
+    def _normalise(word: str) -> str:
+        """Mirror of NormalizeTypeName in Utils.pas."""
+        w = word.lower().replace(" ", "").replace("_", "").replace("-", "")
+        return w[1:] if len(w) > 1 and w.startswith("e") else w
 
     unknown: list[str] = []
     for tool in ("obj_query", "obj_delete", "obj_batch_delete",
                  "obj_modify", "obj_count", "obj_select"):
         doc = (_TOOLS.get(tool) or (lambda: None)).__doc__ or ""
         for word in set(re.findall(r'"(e[A-Z]\w+)"', doc)):
-            if word not in accepted:
+            if _normalise(word) not in accepted:
                 unknown.append(f"{tool}: {word}")
     assert not unknown, (
         f"docstring examples name object types the Pascal never "
         f"accepts: {unknown}")
+
+
+def test_the_spellings_a_caller_actually_used_are_accepted():
+    """Measured on a live board, not imagined.
+
+    One session asked for "Component", then "Sheet", then "Sheet Symbol",
+    then "SheetSymbol", and every one came back INVALID_TYPE with no
+    indication of what would have worked. Three of those four resolve
+    now. "Sheet" deliberately does not, because a sheet is a document
+    rather than an object on one, and the refusal says so.
+    """
+    everything = _pascal_all()
+    sch = set(re.findall(r"N = '(\w+)'",
+                         _function_body(everything, "ObjectTypeFromString")))
+    pcb = set(re.findall(r"N = '(\w+)'",
+                         _function_body(everything,
+                                        "ObjectTypeFromStringPCB")))
+    accepted = sch | pcb
+
+    def _normalise(word: str) -> str:
+        w = word.lower().replace(" ", "").replace("_", "").replace("-", "")
+        return w[1:] if len(w) > 1 and w.startswith("e") else w
+
+    for spelling in ("Component", "component", "Sheet Symbol", "SheetSymbol",
+                     "sheet_symbol", "eSheetSymbol", "pin", "Net Label",
+                     "track", "Polygon", "component_body"):
+        assert _normalise(spelling) in accepted, (
+            f"{spelling!r} still does not resolve. A caller who spells a "
+            f"type the obvious way gets INVALID_TYPE and no list of what "
+            f"would have worked.")
+
+    # And the one that must NOT silently resolve, because accepting it
+    # would return nothing and look like an empty board.
+    assert _normalise("Sheet") not in accepted, (
+        "'Sheet' resolves to an object type. A sheet is a document; "
+        "accepting it returns an empty result that reads as a clean board")

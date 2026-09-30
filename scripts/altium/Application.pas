@@ -5,13 +5,32 @@
 {..............................................................................}
 
 Function App_Ping(RequestId : String) : String;
+Var
+    Ver : String;
 Begin
     // Return the compiled-in SCRIPT_VERSION so Python can detect a stale
     // Altium script cache. cast_errors surfaces the silent-cast counter
     // (see RecordCastError), non-zero at session end indicates an
     // interface mismatch worth investigating.
+    //
+    // altium_version rides along because a bug report without it costs a
+    // round trip, and twice now the answer changed the diagnosis: two
+    // reports of a wedged polling loop were both an Altium far below the
+    // versions this is developed against, naming interfaces that build
+    // does not declare. It is reported, never acted on: an old build
+    // runs most of this toolset perfectly well, and refusing to start
+    // would take away the part that works to prevent the part that does
+    // not. Empty when the API will not answer, which is itself a fact
+    // worth having.
+    Ver := '';
+    Try
+        Ver := Client.GetProductVersion;
+    Except
+        Ver := '';
+    End;
     Result := BuildSuccessResponse(RequestId,
         '{"pong":true,"script_version":"' + SCRIPT_VERSION +
+        '","altium_version":"' + EscapeJsonString(Ver) +
         '","protocol_version":' + IntToStr(PROTOCOL_VERSION) +
         ',"cast_errors":' + IntToStr(CastErrorCount) + '}');
 End;
@@ -39,7 +58,7 @@ Var
     Project : IProject;
     Doc : IDocument;
     I, J : Integer;
-    Data, DocInfo, FileName, FullPath, Kind, LoadedStr : String;
+    Data, DocInfo, FileName, FullPath, Kind, LoadedStr, ModifiedStr : String;
     FirstItem, IsLoaded : Boolean;
 Begin
     Workspace := GetWorkspace;
@@ -81,10 +100,18 @@ Begin
                         Except IsLoaded := False; End;
                         If IsLoaded Then LoadedStr := 'true' Else LoadedStr := 'false';
 
+                        // Unsaved state. app_context filters this list on
+                        // "modified" to warn about pending edits, so a missing
+                        // key made that warning unreachable and every session
+                        // read as clean.
+                        If DocIsModified(FullPath) Then ModifiedStr := 'true'
+                        Else ModifiedStr := 'false';
+
                         DocInfo := '{"file_name":"' + EscapeJsonString(ExtractFileName(FileName)) + '"';
                         DocInfo := DocInfo + ',"file_path":"' + EscapeJsonString(FullPath) + '"';
                         DocInfo := DocInfo + ',"document_kind":"' + EscapeJsonString(Kind) + '"';
-                        DocInfo := DocInfo + ',"loaded":' + LoadedStr + '}';
+                        DocInfo := DocInfo + ',"loaded":' + LoadedStr;
+                        DocInfo := DocInfo + ',"modified":' + ModifiedStr + '}';
                         Data := Data + DocInfo;
                     End;
                 End;
@@ -110,10 +137,11 @@ Begin
         Doc := Workspace.DM_FocusedDocument;
         If Doc <> Nil Then
         Begin
-            FileName := Doc.DM_FileName;
+            FileName := DocFullPath(Doc);
             Data := '{"file_name":"' + EscapeJsonString(ExtractFileName(FileName)) + '"';
             Data := Data + ',"file_path":"' + EscapeJsonString(FileName) + '"';
-            Data := Data + ',"document_kind":"' + EscapeJsonString(Doc.DM_DocumentKind) + '"}';
+            Data := Data + ',"document_kind":"' + EscapeJsonString(Doc.DM_DocumentKind) + '"';
+            Data := Data + ',"modified":' + BoolToJsonStr(DocIsModified(FileName)) + '}';
         End;
     End;
 
@@ -131,19 +159,21 @@ Begin
             FileName := SchDoc.DocumentName;
             Data := '{"file_name":"' + EscapeJsonString(ExtractFileName(FileName)) + '"';
             Data := Data + ',"file_path":"' + EscapeJsonString(FileName) + '"';
-            Data := Data + ',"document_kind":"SCH"}';
+            Data := Data + ',"document_kind":"SCH"';
+            Data := Data + ',"modified":' + BoolToJsonStr(DocIsModified(FileName)) + '}';
         End;
     End;
     If Data = '' Then
     Begin
         Board := Nil;
-        Try Board := GetPCBBoardAnywhere; Except Board := Nil; End;
+        Try Board := GetPCBBoardAnywhere(0); Except Board := Nil; End;
         If Board <> Nil Then
         Begin
             FileName := Board.FileName;
             Data := '{"file_name":"' + EscapeJsonString(ExtractFileName(FileName)) + '"';
             Data := Data + ',"file_path":"' + EscapeJsonString(FileName) + '"';
-            Data := Data + ',"document_kind":"PCB"}';
+            Data := Data + ',"document_kind":"PCB"';
+            Data := Data + ',"modified":' + BoolToJsonStr(DocIsModified(FileName)) + '}';
         End;
     End;
 
@@ -286,7 +316,7 @@ Begin
 
     { Try to get PCB preferences from the active board }
     Try
-        Board := GetPCBBoardAnywhere;
+        Board := GetPCBBoardAnywhere(0);
         If Board <> Nil Then
         Begin
             Data := Data + '"pcb":{';
@@ -572,14 +602,69 @@ End;
 {..............................................................................}
 
 Function App_SaveAll(RequestId : String) : String;
+Var
+    StillDirty, Seen, Written : Integer;
+    Paths, AgesBefore, AgesAfter : String;
 Begin
     Try
         // Iterate every IServerDocument the editor has open and DoFileSave
         // each modified one. This bypasses WorkspaceManager:SaveAll, which
         // silently no-ops in some workspace states, and project-walk-based
         // saves, which skip free documents.
-        SaveAllDirty;
-        Result := BuildSuccessResponse(RequestId, '{"saved":true}');
+        { WHAT REACHED DISK, measured by file timestamp, because every
+          Altium-side signal here has been observed lying. DoFileSave does
+          not raise when the editor declines. ServerDoc.Modified does not
+          always propagate from ProcessControl. And CountDirtyDocuments
+          walks the workspace exactly as SaveAllDirty does, so an empty
+          enumeration made both of them report zero and zero read as
+          success while 29 edits were lost. }
+        Paths := WorkspaceDocPaths(0);
+        Seen := CountPathEntries(Paths);
+        AgesBefore := AgesForPaths(Paths);
+
+        SaveAttempts := 0;
+        SaveAllDirty(0);
+
+        AgesAfter := AgesForPaths(Paths);
+        Written := CountChangedAges(AgesBefore, AgesAfter);
+        StillDirty := CountDirtyDocuments(0);
+
+        If Seen = 0 Then
+            Result := BuildSuccessResponse(RequestId,
+                '{"saved":false,"documents_seen":0,"documents_written":0'
+                + ',"still_dirty":' + IntToStr(StillDirty)
+                + ',"reason":"no documents were enumerated, so nothing was '
+                + 'even attempted. This is NOT an empty-and-clean workspace: '
+                + 'the walk that saves and the count that verifies share a '
+                + 'workspace lookup, so when it comes back empty both report '
+                + 'zero. Use proj_save, which resolves the focused project '
+                + 'directly."}')
+        Else If SaveAttempts = 0 Then
+            Result := BuildSuccessResponse(RequestId,
+                '{"saved":true,"documents_seen":' + IntToStr(Seen)
+                + ',"documents_attempted":0,"documents_written":0'
+                + ',"still_dirty":' + IntToStr(StillDirty)
+                + ',"note":"nothing was open to save. Only a document open '
+                + 'in the editor has an IServerDocument; the rest are project '
+                + 'members that cannot be holding unsaved edits. Writing '
+                + 'nothing is the correct outcome here, not a failure."}')
+        Else If Written = 0 Then
+            Result := BuildSuccessResponse(RequestId,
+                '{"saved":false,"documents_seen":' + IntToStr(Seen)
+                + ',"documents_attempted":' + IntToStr(SaveAttempts)
+                + ',"documents_written":0'
+                + ',"still_dirty":' + IntToStr(StillDirty)
+                + ',"reason":"every open document was written to and not one '
+                + 'got newer on disk. Altium declines a save while a command '
+                + 'is active in the editor, and an abandoned transaction '
+                + 'leaves it in that state with nothing visible on screen. '
+                + 'Unwind the active command and retry, or use proj_save."}')
+        Else
+            Result := BuildSuccessResponse(RequestId,
+                '{"saved":true,"documents_seen":' + IntToStr(Seen)
+                + ',"documents_attempted":' + IntToStr(SaveAttempts)
+                + ',"documents_written":' + IntToStr(Written)
+                + ',"still_dirty":' + IntToStr(StillDirty) + '}');
     Except
         Result := BuildErrorResponse(RequestId, 'SAVE_FAILED', 'SaveAllDirty raised an exception');
     End;
@@ -641,10 +726,74 @@ Begin
         '],"exception":"' + EscapeJsonString(ExceptionMsg) + '"}');
 End;
 
+{ App_ExitActiveCommand - close a transaction a CRASHED handler left open.    }
+{                                                                             }
+{ Altium refuses every save while a command is active, with "A command is     }
+{ currently active and save cannot be completed at this time. Do you want to  }
+{ save copy of current document?". That state lives in the PCB SERVER, not in }
+{ the script, so RESTARTING THE POLLING LOOP DOES NOT CLEAR IT and neither    }
+{ does Escape in the editor.                                                  }
+{                                                                             }
+{ MEASURED on 2026-08-25: saves were being refused on a BRAND NEW library      }
+{ whose only operations were create, activate and create-symbol. The state was }
+{ left earlier the same day by lib_link_3d_model faulting mid-handler on the   }
+{ undeclared Body.Rotation, after PCBServer.PreProcess and before its          }
+{ PostProcess. It then survived several script restarts.                       }
+{                                                                             }
+{ Every PreProcess in this codebase is paired, including on the error paths,   }
+{ so this is not a leak here: it is recovery from a handler that DIED between  }
+{ the two. AltiumScriptCentral ships the same one-line remedy as               }
+{ ExitActiveCommand.vbs, and the note there names the cause as "a script which }
+{ crashed before it could call PCBServer.PostProcess".                         }
+{                                                                             }
+{ Calling PostProcess with nothing outstanding is harmless, which is why the   }
+{ reference script does exactly this and nothing else.                         }
+Function App_ExitActiveCommand(RequestId : String) : String;
+Var
+    PcbOk, SchOk : Boolean;
+    DirtyBefore, DirtyAfter, I : Integer;
+Begin
+    DirtyBefore := CountDirtyDocuments(0);
+
+    { REPEATED, because PreProcess NESTS and one leak is not the only shape.  }
+    { A single PostProcess was measured NOT to clear a real stuck state, and  }
+    { the depth cannot be queried through the API, so the only way down is to }
+    { unwind further than any plausible leak. Calling it with nothing         }
+    { outstanding is harmless, which is the whole basis of the one-line       }
+    { remedy in ExitActiveCommand.vbs.                                        }
+    PcbOk := False;
+    For I := 1 To 8 Do
+        Try
+            PCBServer.PostProcess;
+            PcbOk := True;
+        Except End;
+
+    { The schematic server keeps its own transaction, and a SchLib handler    }
+    { can die the same way, so close that too. Its PostProcess takes the      }
+    { document, and Nil means "whatever is current".                          }
+    SchOk := False;
+    Try
+        SchServer.ProcessControl.PostProcess(SchServer.GetCurrentSchDocument, '');
+        SchOk := True;
+    Except End;
+
+    DirtyAfter := CountDirtyDocuments(0);
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"pcb_post_process":' + BoolToJsonStr(PcbOk)
+        + ',"sch_post_process":' + BoolToJsonStr(SchOk)
+        + ',"dirty_before":' + IntToStr(DirtyBefore)
+        + ',"dirty_after":' + IntToStr(DirtyAfter)
+        + ',"note":"this closes a transaction left open by a handler that '
+        + 'died between PreProcess and PostProcess. It does not itself save '
+        + 'anything: call app_save_all afterwards and check still_dirty."}');
+End;
+
 Function HandleApplicationCommand(Action : String; Params : String; RequestId : String) : String;
 Begin
     Case Action Of
         'ping':                Result := App_Ping(RequestId);
+        'exit_active_command': Result := App_ExitActiveCommand(RequestId);
         'get_version':         Result := App_GetVersion(RequestId);
         'get_open_documents':  Result := App_GetOpenDocuments(RequestId);
         'get_active_document': Result := App_GetActiveDocument(RequestId);
@@ -656,7 +805,7 @@ Begin
         'create_document':     Result := App_CreateDocument(Params, RequestId);
         'save_all':            Result := App_SaveAll(RequestId);
         'diag_workspace':      Result := App_DiagWorkspace(Params, RequestId);
-        'stop_server':         Begin SaveAllDirty; Running := False; Result := BuildSuccessResponse(RequestId, '{"stopped":true}'); End;
+        'stop_server':         Begin SaveAllDirty(0); Running := False; Result := BuildSuccessResponse(RequestId, '{"stopped":true}'); End;
     Else
         Result := BuildErrorResponse(RequestId, 'UNKNOWN_ACTION', 'Unknown application action: ' + Action);
     End;

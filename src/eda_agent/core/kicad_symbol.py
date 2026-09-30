@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from .kicad_footprint import _block_end
+from .kicad_footprint import _block_end, is_inside, is_plain_name
 
 
 def standard_symbol_dirs(cli_path: Optional[str] = None) -> list[str]:
@@ -36,13 +36,26 @@ def standard_symbol_dirs(cli_path: Optional[str] = None) -> list[str]:
 def extract_symbol(lib_id: str, search_dirs: list[str]) -> Optional[str]:
     """Extract a symbol block ("Lib:Name") from a .kicad_sym library, renamed
     to its full lib_id for embedding in a schematic's lib_symbols. None if not
-    found."""
+    found.
+
+    The library half of the id becomes a FILENAME, so it has to be a
+    plain name. Nothing upstream constrains it: ``DesignPlan.Part.lib_ref``
+    is validated for length and nothing else, and it reaches here from a
+    caller-supplied plan. Without this, an id could name a
+    ``.kicad_sym`` anywhere on disk, and this function would report it as
+    a symbol found in one of ``search_dirs``.
+
+    The symbol name is not part of the path, so it is left alone. It is
+    searched for inside the file's text.
+    """
     if not lib_id or ":" not in lib_id:
         return None
     lib, name = lib_id.split(":", 1)
+    if not is_plain_name(lib):
+        return None
     for d in search_dirs:
         f = os.path.join(d, lib + ".kicad_sym")
-        if not os.path.isfile(f):
+        if not os.path.isfile(f) or not is_inside(d, f):
             continue
         try:
             txt = open(f, "r", encoding="utf-8").read()

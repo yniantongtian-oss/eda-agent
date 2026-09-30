@@ -78,6 +78,47 @@ The extension connects on load. The **eda-agent** menu on PCB and schematic
 pages also provides **Connect** and **Disconnect** for reconnecting after the
 server restarts.
 
+**Connection status** on the same menu reports what the extension
+believes, what its last scan found, and which build is running. It is
+there because every other diagnostic is reported in the ping reply,
+over the socket, and is therefore readable exactly when a connection
+already works. The question anybody actually asks is the opposite one,
+and it has to be answerable with no socket at all.
+
+It then asks the server and reports that separately, because **module
+state can only describe the copy you are asking**. Importing a new
+build mid session loads a second copy of the module, and the editor
+fires `onStartupFinished` only at startup, so the new copy never
+activates while the older one keeps the socket and answers every
+command. Measured: a status item reporting "NOT connected, attempts 0,
+retry timer NOT ARMED" on an editor the server showed as connected.
+Both were true. `/health` therefore lists the builds actually holding
+sockets, and the status item says whether this build is one of them.
+
+A failed scan now also toasts, at most once a minute, so a server that
+is not running says so instead of nothing happening.
+
+**No port needs configuring.** The extension scans 49620-49629 (the
+range EasyEDA's own bridge server uses), reads `GET /health` from each,
+and connects only to one whose `service` is `eda-agent-bridge`. That
+check matters: without it, a WebSocket handshake would be sent to
+whatever happened to answer the port.
+
+**That range is shared, and the neighbour is EasyEDA's own bridge.** It
+uses the same ten ports and the same `/eda` path, and answers `/health`
+with `easyeda-bridge`. So a port in the range can be occupied by a
+service that looks almost identical and is not ours, and either server
+can take the port the other wanted. A port answering under another name
+is reported by **Connection status** rather than skipped in silence,
+because "no server found" and "somebody else got the port" call for
+opposite fixes.
+
+**Nothing here requires a host global.** EasyEDA's guidance is that
+standard browser APIs are not available to an extension's main process,
+so `fetch` and the host timers are both preferences with fallbacks, and
+`SYS_Timer` is used when offered. A test loads the extension on a
+runtime with none of the three and requires it to survive.
+
 By default the Python side listens on the first free loopback port in
 `49620-49629`. The extension scans that range and, when `fetch` is available,
 checks `GET /health` for the `eda-agent-bridge` service identity before opening
@@ -117,6 +158,27 @@ Requests are correlated by id so a slow response cannot be mistaken for the
 answer to a later call. The envelope is created centrally in `main.js`; tests
 also check that Python command names, extension handlers, manifest registration
 and the build entry point stay aligned.
+
+The transport is also tested against a fake editor over real sockets,
+and the framing against RFC 6455's own worked example.
+
+**`verified_live: false` on your machine does not mean the code is
+untested.** The command vocabulary HAS round-tripped against a live
+EasyEDA Pro editor, and doing so found and fixed real defects: a wire
+is flat segments rather than points, `add_wire` had never drawn one,
+symbol search caps at ten results with no paging, and net rules answer
+with the word `default` rather than a number.
+
+What `verified_live` reports is narrower and per machine. It is a
+record of which commands have round-tripped **on this install**,
+written only by the smoke script from a real editor, and it is
+deliberately not committed: it describes one machine, one session and
+one EasyEDA version, so shipping it would present somebody else's
+measurement as yours. A fresh clone therefore starts with everything
+unverified, and that is the intended default rather than a warning
+about the code.
+
+Run the smoke script against your editor to populate it.
 
 ## Verification model
 
@@ -163,3 +225,20 @@ For the current backend capability matrix, known limitations and live
 verification semantics, see [`../../docs/BACKENDS.md`](../../docs/BACKENDS.md).
 For delivery acceptance requirements, see
 [`../../docs/DELIVERY_ACCEPTANCE.md`](../../docs/DELIVERY_ACCEPTANCE.md).
+
+`pcb.clear_routing`, `pcb.auto_route` and `pcb.delete_primitives` change
+or remove work wholesale. All three refuse unless `confirm` is true, and
+**both halves check independently**: the extension is reachable by
+anything speaking this protocol, so it cannot assume a caller already
+checked.
+
+## Wheel-packaged extension in this fork
+
+This fork includes the complete EasyEDA extension build payload in the Python wheel and exposes a helper CLI:
+
+```bash
+eda-agent-easyeda-extension path
+eda-agent-easyeda-extension build --dest easyeda-extension
+```
+
+The first command locates the packaged read-only source payload. The second copies it to a writable destination, validates/builds it, and produces an importable `.eext`. Do not build in place inside `site-packages`. The fork's package CI performs the same installed-wheel build before publishing delivery artifacts; see [../../docs/DELIVERY_ACCEPTANCE.md](../../docs/DELIVERY_ACCEPTANCE.md).

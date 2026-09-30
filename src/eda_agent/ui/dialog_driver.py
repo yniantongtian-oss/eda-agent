@@ -399,8 +399,10 @@ def drive(pid: int, intent: str = "proceed", allow_commit: bool = False,
             committed = True
         record["action"] = f"pressed {caption!r}"
         steps.append(record)
+        # wait_for_close has already waited for this one to go. The loop
+        # re-scans for the next dialog immediately, so a further pause
+        # here just delayed finding it.
         win.wait_for_close(dialog["hwnd"], timeout=max(2.0, settle * 4))
-        time.sleep(settle)
 
     return {
         "ok": not needs_human,

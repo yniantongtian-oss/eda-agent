@@ -9,7 +9,7 @@ more precise than claiming every live EDA path has been exercised.
 The Python package version is declared in `pyproject.toml`. A delivery must be
 traceable to one exact Git commit SHA and to CI results for that same SHA.
 
-For version 0.5.0, the release candidate is acceptable only when all automated
+For version 0.6.1, the release candidate is acceptable only when all automated
 gates below pass on the exact commit that will be delivered. Do not rebuild from
 a different checkout and call it the same verified artifact.
 

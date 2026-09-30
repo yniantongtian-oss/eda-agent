@@ -22,6 +22,7 @@ its refusals hold when the thing in front of it is real.
 
 from __future__ import annotations
 
+import itertools
 import subprocess
 import sys
 import time
@@ -37,12 +38,52 @@ pytestmark = pytest.mark.skipif(
     reason="live dialog driving needs win32 and pywin32")
 
 
+#: Makes every spawned caption unique. Windows are matched by a
+#: SUBSTRING of the title, several tests here used the same wording, and
+#: proc.kill() is asynchronous, so a window could outlive its test and be
+#: picked up by the next one. That test then watched a corpse disappear
+#: and reported "the dialog closed during a DRY RUN, so something was
+#: pressed", blaming the driver for a window it never touched. Seen
+#: twice in CI, never locally, because the local runs were ordered and
+#: the runner shuffles.
+_SPAWN_SEQ = itertools.count(1)
+
+
+def _unique(title):
+    """A caption no other test can match, that still classifies the same.
+
+    The suffix goes on the END on purpose. The classifier searches
+    anywhere in the string, so "Continue and proceed?" keeps its
+    question mark and stays a confirmation, and the unrecognised probe
+    stays unrecognised.
+    """
+    return f"{title} [{next(_SPAWN_SEQ)}]"
+
+
 def _spawn(title, buttons):
     script = ("Add-Type -AssemblyName System.Windows.Forms; "
               "[void][System.Windows.Forms.MessageBox]::Show("
               f"'please answer','{title}',"
               f"[System.Windows.Forms.MessageBoxButtons]::{buttons})")
     return subprocess.Popen(["powershell", "-NoProfile", "-Command", script])
+
+
+def _reap(proc, hwnd=None):
+    """Kill the probe AND wait for its window to actually be gone.
+
+    Returning while the window still exists is what let one test's
+    dialog leak into the next.
+    """
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    if hwnd is not None:
+        w.wait_for_close(hwnd, 5.0)
 
 
 @pytest.fixture
@@ -54,7 +95,9 @@ def dialog(request):
     """
     title, buttons = getattr(request, "param", ("eda-agent unknown probe",
                                                 "OKCancel"))
+    title = _unique(title)
     proc = _spawn(title, buttons)
+    found = None
     try:
         found = w.wait_for_window(
             lambda x: title in (x.title or ""), timeout=25)
@@ -63,10 +106,7 @@ def dialog(request):
         dr.forget_ocr()
         yield found
     finally:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _reap(proc, found.hwnd if found is not None else None)
         dr.forget_ocr()
 
 
@@ -191,13 +231,17 @@ def test_an_error_beside_another_dialog_takes_priority_live():
     fail, leaving both on screen. Driving the ordinary one first would
     carry on past a failure the caller has not seen.
     """
-    benign = _spawn("Continue and proceed?", "YesNo")
-    failing = _spawn("Error while doing the thing", "OK")
+    benign_title = _unique("Continue and proceed?")
+    failing_title = _unique("Error while doing the thing")
+    benign = _spawn(benign_title, "YesNo")
+    failing = _spawn(failing_title, "OK")
+    first = None
+    second = None
     try:
         first = w.wait_for_window(
-            lambda x: "Continue and proceed?" in (x.title or ""), timeout=25)
+            lambda x: benign_title in (x.title or ""), timeout=25)
         second = w.wait_for_window(
-            lambda x: "Error while doing" in (x.title or ""), timeout=25)
+            lambda x: failing_title in (x.title or ""), timeout=25)
         if first is None or second is None:
             pytest.skip("both test dialogs did not appear on this host")
         dr.forget_ocr()
@@ -214,11 +258,8 @@ def test_an_error_beside_another_dialog_takes_priority_live():
         assert _still_open(second.hwnd), "it pressed past an error"
         assert _still_open(first.hwnd), "it answered the other dialog too"
     finally:
-        for proc in (benign, failing):
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        _reap(benign, first.hwnd if first is not None else None)
+        _reap(failing, second.hwnd if second is not None else None)
         dr.forget_ocr()
 
 
@@ -240,3 +281,60 @@ def test_blocked_is_false_when_nothing_is_modal():
     assert snapshot["ok"] is True
     assert snapshot["blocked"] is False
     assert snapshot["summary"] == "no dialog is open"
+
+
+# --------------------------------------------------------------------
+# The collision itself, asserted deterministically.
+#
+# The live tests above cannot prove this fix: they passed locally every
+# single time with the broken fixture, including five shuffled runs,
+# and still failed twice in CI. What went wrong was a PROPERTY of the
+# captions, so that is what gets checked here, with no windows and no
+# timing involved.
+# --------------------------------------------------------------------
+
+def test_two_spawns_never_share_a_caption():
+    """The race, removed at the source.
+
+    Windows are matched by substring of the title. With two tests using
+    the same wording and proc.kill() returning before the window is
+    gone, the second test could latch onto the first one's dying dialog
+    and then report the driver had pressed something.
+    """
+    seen = [_unique("eda-agent unknown probe") for _ in range(50)]
+
+    assert len(set(seen)) == 50, "a caption repeated, so the race is back"
+    for caption in seen:
+        others = [o for o in seen if o != caption]
+        assert not any(caption in o for o in others), (
+            f"{caption!r} is a substring of another caption, which is how "
+            f"wait_for_window picks the wrong window")
+
+
+def test_a_unique_caption_still_classifies_the_same():
+    """The suffix must not change what the dialog IS.
+
+    Several tests depend on the classifier's verdict: the probe has to
+    stay unrecognised, the question has to stay a confirmation, and the
+    failure has to stay an error. A prefix, or a suffix that swallowed
+    the question mark, would silently retarget those tests at a
+    different branch while they carried on passing.
+    """
+    for base, expected in (("eda-agent unknown probe", "unknown"),
+                           ("Continue and proceed?", "confirm"),
+                           ("Error while doing the thing", "error")):
+        assert dr.classify(base, []) == expected, f"baseline moved: {base}"
+        assert dr.classify(_unique(base), []) == expected, (
+            f"the uniqueness suffix changed {base!r} from {expected}")
+
+
+def test_the_teardown_waits_for_the_window_to_go():
+    """Killing the process is not the same as the window being gone.
+
+    Returning early is what allowed a dialog to outlive its test.
+    """
+    import inspect
+
+    source = inspect.getsource(_reap)
+    assert "wait_for_close" in source
+    assert "proc.wait" in source

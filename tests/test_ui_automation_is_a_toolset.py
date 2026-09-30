@@ -143,12 +143,17 @@ def test_a_failed_menu_click_does_not_report_success():
 def test_listing_a_menu_activates_altium_first():
     """The bug that made discovery useless.
 
-    Altium lays its DevExpress bars out on ACTIVATION, so reading the
-    bar without activating fails whenever Altium is not already in the
-    foreground. list_only skipped the activation that click_path did,
-    so it could only succeed in the one case where you do not need to
-    ask what the menus are. MEASURED: it returned "the menu bar is not
-    laid out" even with may_steal_focus set.
+    Listing a menu's contents means OPENING it, which is a real click,
+    and Windows sends a synthesised click to the foreground window
+    rather than to the one it was aimed at. So discovery needs the same
+    activation as invoking. list_only skipped it and could therefore
+    only succeed in the one case where you do not need to ask what the
+    menus are. MEASURED: it returned "the menu bar is not laid out"
+    even with may_steal_focus set.
+
+    Reading the top-level BAR is the weaker case and needs only a
+    restore, measured in ui/menu.bring_to_front. This test is about the
+    popup, which needs the focus.
     """
     assert hasattr(menu, "bring_to_front"), (
         "activation must be a shared step, or the next caller that "

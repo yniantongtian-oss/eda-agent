@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, Optional
 from dataclasses import dataclass, field
 
+from eda_agent.atomicfile import discard, replace_with_retry
+
 # NOTE: no cross-process or publish lock is needed here. Each caller writes
 # its own request_<id>.json (staged to .json.tmp, then atomically renamed)
 # and polls its own response_<id>.json, so concurrent publishers -- threads
@@ -48,6 +50,8 @@ from .recovery import (
     CORRUPT_RESPONSE,
 )
 
+from ..safety import refuse_command
+
 logger = logging.getLogger("eda_agent.bridge")
 
 # Wire protocol version. Must match scripts/altium/Main.pas:PROTOCOL_VERSION.
@@ -61,6 +65,23 @@ PROTOCOL_VERSION = 2
 # this gives a 300 s ceiling per command -- plenty for heavy emit / compile
 # passes while still catching runaway handlers.
 _MAX_HEARTBEAT_EXTENSIONS = 30
+
+#: How often to check whether a modal is what is holding a call up, and
+#: how long to wait before the first check.
+#:
+#: RECURRING, NOT ONE SHOT. A dialog does not only appear at the start: a
+#: long handler can raise one part-way through, and a single early probe
+#: would miss it and then wait out the whole timeout in silence, which is
+#: the failure this exists to remove. Checking on an interval catches it
+#: whenever it turns up.
+#:
+#: The first check is delayed so ordinary calls never pay for it. MEASURED
+#: on this workspace, the compile-bound reads are the slowest legitimate
+#: handlers and return in about a second, so a 3 second grace leaves
+#: headroom. After that the cost is one Win32 window enumeration per
+#: interval, against a call that is already stalled.
+_DIALOG_PROBE_AFTER = 3.0
+_DIALOG_PROBE_EVERY = 3.0
 
 # Thread pool for blocking I/O
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -335,19 +356,44 @@ class AltiumBridge:
         return self.process_manager.is_altium_running()
 
     def get_altium_status(self) -> dict:
-        process = self.process_manager.get_altium_info()
-        if process:
+        """Which Altium is running, and whether that is certain.
+
+        ``pid`` is None with ``ambiguous`` set when more than one Altium
+        is running and none can be identified as the one running
+        StartMCPServer; ``reason`` explains and ``candidate_pids`` names
+        them all. Picking one silently used to send every UI tool to a
+        windowless orphan while bridge calls reached the real instance.
+        """
+        selection = self.process_manager.select_altium_process()
+        common = {
+            "candidate_count": len(selection.candidates),
+            "candidate_pids": [c.pid for c in selection.candidates],
+            "selected_by": selection.selected_by,
+        }
+        if selection.process:
             return {
                 "running": True,
-                "pid": process.pid,
-                "exe_path": process.exe_path,
+                "pid": selection.process.pid,
+                "exe_path": selection.process.exe_path,
                 "attached": self._attached,
+                **common,
+            }
+        if selection.candidates:
+            return {
+                "running": True,
+                "pid": None,
+                "exe_path": None,
+                "attached": self._attached,
+                "ambiguous": True,
+                "reason": selection.reason,
+                **common,
             }
         return {
             "running": False,
             "pid": None,
             "exe_path": None,
             "attached": False,
+            **common,
         }
 
     def attach(self) -> bool:
@@ -519,7 +565,16 @@ class AltiumBridge:
         tmp_path = request_path.with_suffix(".json.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(request.to_dict(), f, indent=2)
-        tmp_path.replace(request_path)
+        # The rename can lose a race with a Windows scanner holding the
+        # target. Retried, then allowed to raise: a request that is never
+        # published leaves the caller waiting out the full poll timeout
+        # with nothing to explain the silence, so failing here with the
+        # real error is strictly better than failing there without one.
+        try:
+            replace_with_retry(tmp_path, request_path)
+        except PermissionError:
+            discard(tmp_path)
+            raise
         logger.debug("Published request %s: %s", request.id, request.command)
 
     def _poll_response(self, request_id: str, timeout: float) -> CommandResponse:
@@ -579,17 +634,81 @@ class AltiumBridge:
         poll_count = 0
         first_appearance: Optional[float] = None
         parse_errors = 0
+        next_dialog_probe = start + _DIALOG_PROBE_AFTER
 
         while True:
             poll_count += 1
-            if response_path.exists():
-                if first_appearance is None:
-                    first_appearance = time.monotonic() - start
+
+            # WATCH FOR A DIALOG THROUGHOUT, ON EVERY CALL, NOT JUST AT
+            # TIMEOUT.
+            #
+            # A modal blocks the single-threaded scripting engine, so the
+            # handler cannot answer and cannot say why. Waiting out the
+            # full timeout first turns a question a human could answer in
+            # a second into a two-minute silence, and that cost most of a
+            # working day: nine separate calls hung the whole window while
+            # the same "A command is currently active" prompt sat on
+            # screen the entire time.
+            #
+            # Checked on an interval rather than once, because a handler
+            # can raise a dialog part-way through and a single early probe
+            # would miss exactly that case.
+            #
+            # The probe is Win32 and does NOT use the bridge, which is why
+            # it works precisely when the bridge does not.
+            now = time.monotonic()
+            if first_appearance is None and now >= next_dialog_probe:
+                next_dialog_probe = now + _DIALOG_PROBE_EVERY
+                early = self._dialog_probe()
+                if early and early.get("blocked"):
+                    waited = now - start
                     _trace_log(
                         workspace_dir,
-                        f"POLL_SEEN id={request_id[:8]} "
-                        f"after={first_appearance*1000:.0f}ms polls={poll_count}",
+                        f"POLL_DIALOG id={request_id[:8]} "
+                        f"after={waited:.1f}s "
+                        f"summary={early.get('summary', '')[:120]}",
                     )
+                    raise AltiumTimeoutError(
+                        f"Altium is showing a modal dialog {waited:.0f}s into "
+                        f"this call, so the handler cannot run and waiting for "
+                        f"the timeout would tell you nothing more."
+                        + self._dialog_suffix(early),
+                        details={"dialogs": early,
+                                 "blocked_after_seconds": round(waited, 1)},
+                    )
+            # DO NOT OPEN AN EMPTY RESPONSE. SaveToFile creates the file
+            # and then writes it, so polling on existence alone opened a
+            # 0-byte file, failed to parse, and came straight back to open
+            # it again. Every one of those opens is a handle Altium's
+            # exclusive create can collide with, and that collision
+            # surfaces as an EFCreateError modal that stalls the polling
+            # loop rather than an exception the script can catch.
+            # stat() takes no handle, so this costs nothing.
+            #
+            # first_appearance IS SET ON APPEARANCE, not on the first
+            # successful open. The deadline branch below treats a None
+            # first_appearance as "never seen it" and loops again, so
+            # tying it to a successful parse made a permanently empty
+            # response spin forever instead of timing out. That is the
+            # exact hazard the comment down there warns about, reached
+            # through the other branch.
+            appeared = response_path.exists()
+            if appeared and first_appearance is None:
+                first_appearance = time.monotonic() - start
+                _trace_log(
+                    workspace_dir,
+                    f"POLL_SEEN id={request_id[:8]} "
+                    f"after={first_appearance*1000:.0f}ms polls={poll_count}",
+                )
+
+            ready = False
+            if appeared:
+                try:
+                    ready = response_path.stat().st_size > 0
+                except OSError:
+                    ready = False
+
+            if ready:
                 try:
                     with open(response_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -688,12 +807,26 @@ class AltiumBridge:
 
         if extensions >= _MAX_HEARTBEAT_EXTENSIONS:
             self._note_fault(workspace_dir, recovery_guidance(STUCK_HANDLER))
+            # PAST TENSE, because that is all the evidence supports. This
+            # message used to say "Altium IS responding to keepalives ...
+            # likely stuck in an infinite loop", present tense, as a fixed
+            # string on this branch. It is inferred from heartbeats seen
+            # EARLIER in the wait, and nothing rechecks at timeout.
+            #
+            # MEASURED: a handler hit an uncatchable DelphiScript fault, the
+            # polling loop DIED, app_ping was already failing well before the
+            # 300s mark, and this still reported the loop as answering and
+            # pointed recovery at a stuck handler rather than a dead one.
+            # Those two call for different actions, so the wrong guess costs
+            # real time.
             raise AltiumTimeoutError(
                 f"Handler exceeded {_MAX_HEARTBEAT_EXTENSIONS} heartbeat "
                 f"extensions ({_MAX_HEARTBEAT_EXTENSIONS * timeout:.0f}s "
-                f"total); Altium is responding to keepalives but the command "
-                f"never returned. The handler is likely stuck in an infinite "
-                f"loop. " + recovery_message(STUCK_HANDLER)
+                f"total). Altium WAS answering keepalives earlier in the "
+                f"wait, but that is not rechecked here, so the loop may be "
+                f"stuck in a long operation OR may since have died. Confirm "
+                f"with app_ping before choosing a recovery. "
+                + recovery_message(STUCK_HANDLER)
                 + self._dialog_suffix(probe),
                 details={"recovery": recovery_guidance(STUCK_HANDLER),
                          "dialogs": probe},
@@ -796,6 +929,10 @@ class AltiumBridge:
         params: Optional[dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Any:
+        refusal = refuse_command(command)
+        if refusal is not None:
+            return {"success": False, "error": {
+                "code": "REFUSED_BY_POLICY", "message": refusal}}
         if not self.is_altium_running():
             raise AltiumNotRunningError()
         if timeout is None:
@@ -809,6 +946,10 @@ class AltiumBridge:
         params: Optional[dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Any:
+        refusal = refuse_command(command)
+        if refusal is not None:
+            return {"success": False, "error": {
+                "code": "REFUSED_BY_POLICY", "message": refusal}}
         if not self.is_altium_running():
             raise AltiumNotRunningError()
         if timeout is None:

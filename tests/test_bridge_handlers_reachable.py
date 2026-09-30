@@ -73,6 +73,14 @@ KNOWN_UNREACHABLE = {
     "fillet_corners",
     "measure_distance",
     "place_compile_mask",
+    # Deliberately unreachable from Python: the handler refuses, and
+    # pcb_set_via_soldermask_relief refuses locally rather than send to
+    # it. Reaching it means putting the command on the wire, and a
+    # session running a deployed script older than 2026.09.10.3 still
+    # has the write that takes the scripting engine down. The handler
+    # stays as the second layer, for tool_invoke and raw commands.
+    # See tests/test_via_soldermask_relief_is_refused.py.
+    "set_via_soldermask_relief",
 }
 
 #: The modules do NOT all dispatch the same way, and matching only one
@@ -250,10 +258,19 @@ KNOWN_UNHANDLED: dict[str, str] = {}
 
 def _category_to_module() -> dict[str, str]:
     """Parsed from ProcessCommand's ``Case Category Of`` block."""
-    text = (PASCAL_DIR / "Dispatcher.pas").read_text(
-        encoding="utf-8", errors="replace")
-    routes = dict(re.findall(
-        r"'(\w+)':\s*Result\s*:=\s*(Handle\w+Command)", text))
+    # Located by content: the routing moved from Dispatcher.pas into
+    # StatusForm.pas when the poll loop became a timer on the dashboard,
+    # and a filename would pin this to where it happened to be.
+    routes: dict[str, str] = {}
+    for path in sorted(PASCAL_DIR.glob("*.pas")):
+        if path.name == "Altium_MCP.pas":
+            continue
+        found = dict(re.findall(
+            r"'(\w+)':\s*Result\s*:=\s*(Handle\w+Command)",
+            path.read_text(encoding="utf-8", errors="replace")))
+        if found:
+            routes = found
+            break
     assert routes, "could not parse the dispatcher's category routing"
 
     defined_in: dict[str, str] = {}

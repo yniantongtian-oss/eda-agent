@@ -75,7 +75,7 @@ End;
 { 1. JSON Parsing Tests                                                        }
 {..............................................................................}
 
-Procedure TestJsonParsing;
+Procedure TestJsonParsing(Dummy : Integer);
 Var
     Json : String;
 Begin
@@ -127,7 +127,7 @@ End;
 { 2. JSON Array Extraction Tests                                               }
 {..............................................................................}
 
-Procedure TestJsonArrayExtraction;
+Procedure TestJsonArrayExtraction(Dummy : Integer);
 Var
     Json, Res : String;
 Begin
@@ -155,7 +155,7 @@ End;
 { 3. JSON Escaping Tests                                                       }
 {..............................................................................}
 
-Procedure TestJsonEscaping;
+Procedure TestJsonEscaping(Dummy : Integer);
 Begin
     AssertEqual(EscapeJsonString('hello'), 'hello', 'EscapeJsonString no escaping');
     AssertEqual(EscapeJsonString(''), '', 'EscapeJsonString empty');
@@ -171,7 +171,7 @@ End;
 { 4. Response Builder Tests                                                    }
 {..............................................................................}
 
-Procedure TestResponseBuilders;
+Procedure TestResponseBuilders(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -203,7 +203,7 @@ End;
 { 5. Coordinate Conversion Tests                                               }
 {..............................................................................}
 
-Procedure TestCoordinates;
+Procedure TestCoordinates(Dummy : Integer);
 Begin
     AssertIntEqual(MilsToCoord(100), 1000000, 'MilsToCoord 100 mils');
     AssertIntEqual(MilsToCoord(0), 0, 'MilsToCoord zero');
@@ -220,7 +220,7 @@ End;
 { 6. String Helper Tests                                                       }
 {..............................................................................}
 
-Procedure TestStringHelpers;
+Procedure TestStringHelpers(Dummy : Integer);
 Begin
     // StrToIntDef
     AssertIntEqual(StrToIntDef('42', 0), 42, 'StrToIntDef valid');
@@ -252,7 +252,7 @@ End;
 { 7. Object Type Mapping Tests                                                 }
 {..............................................................................}
 
-Procedure TestObjectTypeMappings;
+Procedure TestObjectTypeMappings(Dummy : Integer);
 Begin
     // Schematic object types
     AssertTrue(ObjectTypeFromString('eNetLabel') <> -1, 'ObjectTypeFromString eNetLabel');
@@ -286,7 +286,7 @@ End;
 { 8. Layer Mapping Tests                                                       }
 {..............................................................................}
 
-Procedure TestLayerMappings;
+Procedure TestLayerMappings(Dummy : Integer);
 Begin
     // String to layer and back
     AssertEqual(GetLayerString(GetLayerFromString('TopLayer')), 'TopLayer', 'Layer round-trip TopLayer');
@@ -306,12 +306,12 @@ End;
 { 9. File I/O Round-Trip Tests                                                 }
 {..............................................................................}
 
-Procedure TestFileIO;
+Procedure TestFileIO(Dummy : Integer);
 Var
     Content, ReadBack : String;
     TestPath : String;
 Begin
-    EnsureWorkspaceDir;
+    EnsureWorkspaceDir(0);
     TestPath := WorkspaceDir + 'selftest_temp.json';
 
     // Write and read back plain JSON
@@ -341,7 +341,7 @@ End;
 { 10. Application Command Tests                                                }
 {..............................................................................}
 
-Procedure TestApplicationCommands;
+Procedure TestApplicationCommands(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -384,7 +384,7 @@ End;
 { 11. Project Command Tests                                                    }
 {..............................................................................}
 
-Procedure TestProjectCommands;
+Procedure TestProjectCommands(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -403,7 +403,7 @@ End;
 { 12. Library Command Tests                                                    }
 {..............................................................................}
 
-Procedure TestLibraryCommands;
+Procedure TestLibraryCommands(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -424,7 +424,7 @@ End;
 { 13. Generic Command Tests                                                    }
 {..............................................................................}
 
-Procedure TestGenericCommands;
+Procedure TestGenericCommands(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -470,7 +470,7 @@ End;
 { 14. Command Dispatch Tests                                                   }
 {..............................................................................}
 
-Procedure TestCommandDispatch;
+Procedure TestCommandDispatch(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -530,19 +530,19 @@ Begin
     WriteFileContent(Path, Json);
 End;
 
-Procedure TestIPCRoundTrip;
+Procedure TestIPCRoundTrip(Dummy : Integer);
 Var
     RequestPath, ResponsePath, ResponseJson : String;
     ProcessedOk : Boolean;
 Begin
-    EnsureWorkspaceDir;
-    CleanupOrphanRequests;
+    EnsureWorkspaceDir(0);
+    CleanupOrphanRequests(0);
 
     WriteSelfTestRequest('ipctest1', 'application.ping');
     RequestPath := RequestFilePath('ipctest1');
     AssertTrue(FileExists(RequestPath), 'IPC request file exists after write');
 
-    ProcessedOk := ProcessSingleRequest;
+    ProcessedOk := ProcessSingleRequest(0);
     AssertTrue(ProcessedOk, 'ProcessSingleRequest returns True');
     AssertTrue(Not FileExists(RequestPath), 'IPC request file deleted after processing');
 
@@ -556,7 +556,7 @@ Begin
     If FileExists(ResponsePath) Then DeleteFile(ResponsePath);
 
     WriteSelfTestRequest('ipctest2', 'application.get_version');
-    ProcessedOk := ProcessSingleRequest;
+    ProcessedOk := ProcessSingleRequest(0);
     AssertTrue(ProcessedOk, 'IPC version request processed');
     ResponsePath := ResponseFilePath('ipctest2');
     ResponseJson := ReadFileContent(ResponsePath);
@@ -565,7 +565,7 @@ Begin
     If FileExists(ResponsePath) Then DeleteFile(ResponsePath);
 
     WriteSelfTestRequest('ipctest3', 'bogus.command');
-    ProcessedOk := ProcessSingleRequest;
+    ProcessedOk := ProcessSingleRequest(0);
     AssertTrue(ProcessedOk, 'IPC bogus command processed');
     ResponsePath := ResponseFilePath('ipctest3');
     ResponseJson := ReadFileContent(ResponsePath);
@@ -575,12 +575,12 @@ Begin
 
     // Empty request file: dispatcher reads empty body, deletes file, returns False.
     WriteFileContent(RequestFilePath('ipctest4'), '');
-    ProcessedOk := ProcessSingleRequest;
+    ProcessedOk := ProcessSingleRequest(0);
     AssertTrue(Not ProcessedOk, 'ProcessSingleRequest returns False for empty request body');
 
     // No request file at all: ScanForRequestFile finds nothing, returns False.
-    CleanupOrphanRequests;
-    ProcessedOk := ProcessSingleRequest;
+    CleanupOrphanRequests(0);
+    ProcessedOk := ProcessSingleRequest(0);
     AssertTrue(Not ProcessedOk, 'ProcessSingleRequest returns False when no file');
 End;
 
@@ -588,7 +588,7 @@ End;
 { 16. Application RunProcess Parameter Parsing Tests                           }
 {..............................................................................}
 
-Procedure TestRunProcessParsing;
+Procedure TestRunProcessParsing(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -607,7 +607,7 @@ End;
 { 17. Edge Case Tests                                                          }
 {..............................................................................}
 
-Procedure TestEdgeCases;
+Procedure TestEdgeCases(Dummy : Integer);
 Var
     Resp : String;
 Begin
@@ -624,7 +624,7 @@ Begin
     AssertEqual(ExtractJsonValue(Resp, 'ok'), 'true', 'ExtractJsonValue after array');
 
     // Ensure workspace dir exists
-    EnsureWorkspaceDir;
+    EnsureWorkspaceDir(0);
     AssertTrue(DirectoryExists(WorkspaceDir), 'WorkspaceDir exists after EnsureWorkspaceDir');
 End;
 
@@ -647,7 +647,7 @@ End;
 { needs no document, so it belongs with the pure-logic tests above.           }
 {..............................................................................}
 
-Procedure TestIeeeSymbolConverters;
+Procedure TestIeeeSymbolConverters(Dummy : Integer);
 Begin
     { The two that carry schematic meaning. eDot draws the inversion    }
     { bubble of an active-low pin, eClock the wedge of a clock pin.     }
@@ -696,7 +696,15 @@ Begin
     AssertEqual(StripChar('', '_'), '', 'StripChar handles an empty string');
 End;
 
-Procedure RunSelfTest;
+{ Hidden from the Run Script dialog by its argument, like every other
+  helper here. A user never runs this: it is a developer check, it ends
+  in ShowMessage, and the dialog exists for the one thing a user does,
+  which is starting the bridge.
+
+  To run it, give this routine back its parameterless form temporarily.
+  That is deliberate friction on a developer action rather than a
+  permanent entry in a list a user is choosing from. }
+Procedure RunSelfTest(Dummy : Integer);
 Var
     Summary : String;
     LogPath : String;
@@ -705,29 +713,29 @@ Begin
     SelfTest_Failed := 0;
     SelfTest_Log := '';
 
-    EnsureWorkspaceDir;
+    EnsureWorkspaceDir(0);
 
     // Pure logic tests (no Altium document APIs needed)
-    TestJsonParsing;
-    TestJsonArrayExtraction;
-    TestJsonEscaping;
-    TestResponseBuilders;
-    TestCoordinates;
-    TestStringHelpers;
-    TestObjectTypeMappings;
-    TestLayerMappings;
-    TestIeeeSymbolConverters;
-    TestFileIO;
-    TestEdgeCases;
-    TestRunProcessParsing;
+    TestJsonParsing(0);
+    TestJsonArrayExtraction(0);
+    TestJsonEscaping(0);
+    TestResponseBuilders(0);
+    TestCoordinates(0);
+    TestStringHelpers(0);
+    TestObjectTypeMappings(0);
+    TestLayerMappings(0);
+    TestIeeeSymbolConverters(0);
+    TestFileIO(0);
+    TestEdgeCases(0);
+    TestRunProcessParsing(0);
 
     // Command tests (need Altium running)
-    TestApplicationCommands;
-    TestProjectCommands;
-    TestLibraryCommands;
-    TestGenericCommands;
-    TestCommandDispatch;
-    TestIPCRoundTrip;
+    TestApplicationCommands(0);
+    TestProjectCommands(0);
+    TestLibraryCommands(0);
+    TestGenericCommands(0);
+    TestCommandDispatch(0);
+    TestIPCRoundTrip(0);
 
     // Build summary
     If SelfTest_Failed = 0 Then

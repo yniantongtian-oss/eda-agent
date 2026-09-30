@@ -2,7 +2,7 @@
   "name": "eda-agent-bridge",
   "uuid": "2530edab303a4c3cabf72ffed20d5b9b",
   "displayName": "eda-agent bridge",
-  "version": "0.9.23",
+  "version": "0.9.27",
   "entry": "./dist/index",
   "description": "Serves eda-agent commands to a local MCP server over a WebSocket the editor dials out to.",
   "publisher": "George Saliba",
@@ -31,6 +31,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -49,6 +54,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -67,6 +77,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -85,6 +100,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -103,6 +123,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -121,6 +146,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }
@@ -139,6 +169,11 @@
             "id": "disconnect",
             "title": "Disconnect",
             "registerFn": "disconnect"
+          },
+          {
+            "id": "status",
+            "title": "Connection status",
+            "registerFn": "status"
           }
         ]
       }

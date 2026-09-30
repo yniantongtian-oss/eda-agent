@@ -35,26 +35,80 @@ def standard_footprint_dirs(cli_path: Optional[str] = None) -> list[str]:
     return dirs
 
 
+#: Characters that turn a name into a path. A library nickname and a
+#: symbol or footprint name are IDENTIFIERS, and these functions treat
+#: them as one path component each, so anything that could make a
+#: component mean somewhere else is refused outright.
+#:
+#: The colon matters as much as the separators, and only on Windows:
+#: ``os.path.join(d, "C:evil")`` returns ``"C:evil"``, because a drive
+#: prefix makes the second argument absolute and the first is discarded
+#: entirely. That is not traversal out of the search directory, it is
+#: ignoring the search directory, and a rule written only against ``..``
+#: would not have caught it.
+_PATHISH = ("/", "\\", ":", "\x00")
+
+
+def is_plain_name(part: str) -> bool:
+    """Whether ``part`` is usable as a single path component.
+
+    Deliberately a rejection of path syntax rather than an allow-list of
+    characters. KiCad names carry ``+``, ``-``, ``.``, ``~`` and ``#``
+    (``+3V3``, ``C_Polarized``, ``74HC00``), so enumerating what is
+    permitted would be a guess about somebody else's naming rules and
+    would refuse parts that exist.
+    """
+    if not part or part in (".", ".."):
+        return False
+    return not any(ch in part for ch in _PATHISH)
+
+
+def is_inside(base: str, candidate: str) -> bool:
+    """Whether ``candidate`` resolves to something under ``base``.
+
+    The second half of the check, and the one that does not rely on
+    having thought of every dangerous spelling. ``is_plain_name`` refuses
+    the input; this confirms the OUTPUT landed where it was supposed to,
+    after symlinks and ``..`` have been resolved.
+    """
+    try:
+        b = os.path.realpath(base)
+        c = os.path.realpath(candidate)
+    except (OSError, ValueError):
+        return False
+    return c == b or c.startswith(b + os.sep)
+
+
 def find_footprint_file(lib_id: str, search_dirs: list[str]) -> Optional[str]:
     """Resolve a footprint lib_id ("Lib:Name") to its .kicad_mod path, or None.
 
     A bare name (no ``:``) is looked up across every library.
+
+    A lib_id that is not two plain names resolves to nothing. This
+    function's contract is that it searches ``search_dirs``, and both
+    halves of the id land in the path it builds, so without this a
+    caller-supplied id could name a file outside them and still be
+    answered as though it had been found in a library.
     """
     if not lib_id:
         return None
     if ":" in lib_id:
         lib, name = lib_id.split(":", 1)
+        if not (is_plain_name(lib) and is_plain_name(name)):
+            return None
         for d in search_dirs:
             cand = os.path.join(d, lib + ".pretty", name + ".kicad_mod")
-            if os.path.isfile(cand):
+            if os.path.isfile(cand) and is_inside(d, cand):
                 return cand
+        return None
+    if not is_plain_name(lib_id):
         return None
     for d in search_dirs:
         try:
             for entry in os.listdir(d):
                 if entry.endswith(".pretty"):
                     cand = os.path.join(d, entry, lib_id + ".kicad_mod")
-                    if os.path.isfile(cand):
+                    if os.path.isfile(cand) and is_inside(d, cand):
                         return cand
         except OSError:
             continue

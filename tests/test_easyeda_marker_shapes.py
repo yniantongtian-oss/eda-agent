@@ -81,7 +81,21 @@ def test_the_five_types_are_the_documented_enum():
     """A sixth type appearing would be silently unusable here."""
     enum = (_REF / "enums" / "EDMT_IndicatorMarkerType.md").read_text(
         encoding="utf-8")
-    documented = set(re.findall(r'`"([a-z]+)"`', enum))
+    # EITHER QUOTE. The vendor writes the enum values into a markdown
+    # table, and which quote character it uses is their formatting
+    # rather than the API. It changed: the reference published in
+    # August wrote `"arc"` and the current one writes `'arc'`, along
+    # with switching the prose from Chinese to English. The five values
+    # are identical.
+    #
+    # Matching only double quotes made this read NOTHING and compare an
+    # empty set, so a cosmetic edit upstream failed as though the
+    # marker types had disappeared.
+    documented = set(re.findall(r"""`['"]([a-z]+)['"]`""", enum))
+    assert documented, (
+        "no enum values parsed out of EDMT_IndicatorMarkerType.md. The "
+        "reference's table format has changed again; fix the parser "
+        "rather than the expectation")
     assert documented == set(_EXPECTED), (
         f"the reference documents {sorted(documented)} and this file "
         f"expects {sorted(_EXPECTED)}")

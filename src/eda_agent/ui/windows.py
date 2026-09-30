@@ -15,10 +15,39 @@ Two rules the callers depend on:
 * Matching is by window CLASS and caption together. A caption alone is
   not identifying: Altium reuses captions across dialogs, and other
   applications can hold a window with the same title.
+
+
+WARNING: THIS MODULE CAN SYNTHESISE REAL INPUT, and synthesised input is
+not addressed to a window. keybd_event and mouse_event go to whatever is
+ACTIVE at the instant they fire, and a click lands on whatever is under
+the pointer. Everything else in this package addresses a handle and
+cannot go astray; only that path can.
+
+It is here because large parts of Altium have no other route:
+execute_menu reports success while invoking nothing, GetMenu returns 0
+on a DevExpress bar, and whole dialogs such as Update From Libraries
+have no scripting API at all.
+
+Three things contain it, and all three are enforced by
+tests/test_foreground_guard.py:
+
+  a check immediately before EVERY event, including between a key press
+  and its release, which refocuses the target rather than refusing
+
+  coordinates confined to the target application, because a foreground
+  check proves which app is active and says nothing about where the
+  pointer is
+
+  a kill switch, EDA_AGENT_UI_AUTOMATION=0, which refuses every
+  synthesised event while leaving reads working
+
+See docs/ui-automation.md.
 """
 
 from __future__ import annotations
 
+import ctypes
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -80,6 +109,228 @@ _NOT_BUTTON_CLASSES = ("check", "radio", "group", "docbar",
 #: apart by these bits alone.
 _BS_TYPEMASK = 0x0000000F
 _BS_PRESSABLE = (0x0, 0x1, 0x8, 0xB)   # push, default-push, user, ownerdraw
+
+
+#: Kill switch. UI automation is ON by default, because for a great deal
+#: of Altium there is no other route: see the module docstring and
+#: docs/ui-automation.md. Set this to 0/false/no/off to refuse every
+#: synthesised event.
+UI_AUTOMATION_ENV = "EDA_AGENT_UI_AUTOMATION"
+_OFF = ("0", "false", "no", "off", "disable", "disabled")
+
+
+class AutomationDisabled(RuntimeError):
+    """UI automation is switched off by EDA_AGENT_UI_AUTOMATION."""
+
+
+def automation_enabled() -> bool:
+    """Whether synthesised input is permitted at all.
+
+    READ AT CALL TIME, not at import, so it can be turned off in a
+    running process and takes effect on the very next event rather than
+    on the next restart.
+    """
+    raw = os.environ.get(UI_AUTOMATION_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _OFF
+
+
+def _gate(what: str) -> None:
+    """Refuse everything when the kill switch is set.
+
+    Placed in the primitives rather than only in the tools, so a caller
+    reaching past the tool layer is stopped too. Every synthesised event
+    in this package passes through here or through require_foreground.
+    """
+    if not automation_enabled():
+        raise AutomationDisabled(
+            f"refusing {what}: UI automation is disabled by "
+            f"{UI_AUTOMATION_ENV}. Unset it, or set it to 1, to allow "
+            f"synthesised keyboard and mouse input again")
+
+
+class ForegroundLost(RuntimeError):
+    """Could not give the target the foreground, so input was not sent."""
+
+
+#: GetAncestor(GA_ROOT), SW_RESTORE. Activation applies to the top-level
+#: window, not to the child control an event is aimed at.
+_GA_ROOT = 2
+_SW_RESTORE = 9
+_SW_SHOW = 5
+
+
+class ForeignTarget(RuntimeError):
+    """Refused: the point or window does not belong to the target app."""
+
+
+def window_at(x: int, y: int):
+    """The window under a screen point, or None."""
+    try:
+        return int(ctypes.windll.user32.WindowFromPoint(
+            wintypes.POINT(int(x), int(y)))) or None
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def require_point_in_app(x: int, y: int, target, what: str = "a click") -> int:
+    """Refuse to click a point that is not over the target application.
+
+    THE FOREGROUND CHECK IS NOT ENOUGH ON ITS OWN. It proves the right
+    application is active; it says nothing about where the pointer is.
+    A coordinate outside Altium's window, or over something floating on
+    top of it, is still delivered to whatever is at that point, and a
+    click can raise that window and put the NEXT event there too.
+
+    Only coordinate entry points need this. Every other target in this
+    package is resolved by name out of dialogs(pid) or frame(pid) and is
+    therefore already confined to the process; a caller cannot pass a
+    handle in from outside.
+
+    Returns the window under the point, so a caller can report what was
+    actually there.
+    """
+    want = window_pid(target)
+    if want is None:
+        raise ForeignTarget(f"refusing {what}: the target window is gone")
+    under = window_at(x, y)
+    if under is None:
+        raise ForeignTarget(
+            f"refusing {what} at ({x}, {y}): there is no window at that "
+            f"point")
+    got = window_pid(under)
+    if got != want:
+        raise ForeignTarget(
+            f"refusing {what} at ({x}, {y}): that point is over a window "
+            f"belonging to process {got}, not to the target application "
+            f"({want}). Coordinates are only accepted over the "
+            f"application this tool drives")
+    return under
+
+
+def foreground_pid():
+    """Process id owning the foreground window, or None."""
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def window_pid(hwnd):
+    """Process id owning a window, or None."""
+    try:
+        return int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def window_title(hwnd) -> str:
+    """A window's caption, or '' when it cannot be read or is gone."""
+    try:
+        return str(win32gui.GetWindowText(int(hwnd)) or "")
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
+def owns_foreground(hwnd) -> bool:
+    """Whether hwnd's APPLICATION is the active one.
+
+    By process, not by handle: a dialog, a popup menu and the main frame
+    are different windows of the same application and all are legitimate
+    targets for input aimed at any of them.
+    """
+    target = window_pid(hwnd)
+    return target is not None and foreground_pid() == target
+
+
+def _force_foreground(root: int) -> None:
+    """Raise a window, working around Windows' foreground lock.
+
+    A BARE SetForegroundWindow IS USUALLY DENIED. Windows only grants it
+    to a process that already owns the foreground, or that is otherwise
+    entitled, and this one is a background console. It fails SILENTLY:
+    the call returns and the window stays where it was. MEASURED here as
+    a refusal to send a keystroke to a minimized Altium, and it is why
+    bring_to_front used to report success it had never confirmed.
+
+    The supported way through is to attach this thread's input queue to
+    the foreground window's thread, which makes the two count as one
+    input context for the duration, and to detach immediately after.
+
+    Nothing is synthesised here, so this is not itself an input event
+    and needs no guard of its own.
+    """
+    user32 = ctypes.windll.user32
+    current = ctypes.windll.kernel32.GetCurrentThreadId()
+    active = user32.GetForegroundWindow()
+    other = user32.GetWindowThreadProcessId(active, None) if active else 0
+
+    attached = False
+    if other and other != current:
+        attached = bool(user32.AttachThreadInput(current, other, True))
+    try:
+        user32.ShowWindow(root, _SW_SHOW)
+        user32.BringWindowToTop(root)
+        user32.SetForegroundWindow(root)
+    finally:
+        if attached:
+            user32.AttachThreadInput(current, other, False)
+
+
+def require_foreground(hwnd, what: str = "input", timeout: float = 1.2) -> bool:
+    """Make the target active, then confirm it, IMMEDIATELY BEFORE an event.
+
+    SYNTHESISED INPUT IS NOT ADDRESSED TO A WINDOW. keybd_event and
+    mouse_event go to whatever is active at the instant they fire, so a
+    keystroke meant for Altium lands in whatever the user switched to
+    and a click lands wherever the pointer now is. Every other read in
+    this package is addressed to a handle and cannot do this; only the
+    synthesis path can.
+
+    MEASURED, and the reason this exists: a keyboard walk of the menu
+    bar kept sending Alt and arrow keys after Altium had lost the
+    foreground. Nothing was harmed that time, which was luck.
+
+    IT REFOCUSES RATHER THAN REFUSING. Focus moves for ordinary reasons
+    between one event and the next, and failing the whole operation
+    because the user glanced at another window would make this unusable.
+    So the window is restored and raised, and only a target that will
+    not come forward raises.
+
+    Called before EVERY event rather than once per operation, including
+    between a key press and its release: a key held while focus moves
+    releases into another application.
+
+    Returns True when it had to refocus, False when it was already
+    active, so a caller can tell a clean run from a recovered one.
+    """
+    _gate(what)
+    target = window_pid(hwnd)
+    if target is None:
+        raise ForegroundLost(
+            f"refusing to send {what}: the target window is gone")
+    if foreground_pid() == target:
+        return False
+
+    user32 = ctypes.windll.user32
+    root = user32.GetAncestor(int(hwnd), _GA_ROOT) or int(hwnd)
+    if user32.IsIconic(root):
+        user32.ShowWindow(root, _SW_RESTORE)
+        wait_until(lambda: not user32.IsIconic(root), timeout)
+    _force_foreground(root)
+    wait_until(lambda: foreground_pid() == target, timeout)
+
+    if foreground_pid() != target:
+        raise ForegroundLost(
+            f"refusing to send {what}: the target could not be brought to "
+            f"the front and the active window belongs to process "
+            f"{foreground_pid()}, not {target}. Synthesised input goes to "
+            f"whatever is active, so this would have gone elsewhere")
+    return True
 
 
 @dataclass
@@ -434,8 +685,50 @@ def wait_for_window(match: Callable, timeout: float,
     return None
 
 
-def wait_for_close(hwnd: int, timeout: float, poll: float = 0.25) -> bool:
-    """Wait for a window to disappear. True if it did."""
+def wait_until(check, timeout: float, poll: float = 0.02) -> bool:
+    """Poll ``check`` until it is true, or ``timeout`` elapses.
+
+    A FIXED SLEEP PAYS THE WORST CASE EVERY TIME. The UI path was built
+    on them, and they add up: focusing the frame cost 0.8s whether or
+    not Altium was already in front, and one menu click cost 0.58s in
+    three sleeps. A two-level path therefore spent about two seconds
+    waiting before it did anything.
+
+    The timeout stays what the sleep was, so nothing gets less patient.
+    What changes is the common case, where the condition is already true
+    and this returns in microseconds.
+
+    The poll is deliberately much shorter than the waits it replaces. It
+    is a ``GetForegroundWindow`` or an ``IsIconic``, which cost nothing;
+    polling slower than the thing being waited for would give back the
+    time this exists to save.
+    """
+    if check():
+        return True
+    deadline = time.monotonic() + timeout
+    interval = poll
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        if check():
+            return True
+        # BACK OFF. A flat fast poll is right for the first fraction of a
+        # second, when most of these resolve, and wrong for the long tail:
+        # a menu that takes six seconds would otherwise be asked a hundred
+        # and twenty times, and each ask here can be a window enumeration
+        # and an accessible-tree walk. Doubling keeps the fast case fast
+        # and stops a slow one burning CPU for the whole wait.
+        if interval < 0.25:
+            interval = min(0.25, interval * 2)
+    return False
+
+
+def wait_for_close(hwnd: int, timeout: float, poll: float = 0.05) -> bool:
+    """Wait for a window to disappear. True if it did.
+
+    Polled at 0.05 rather than 0.25: IsWindow is a cheap call and this
+    is on the path of every dialog the driver dismisses, so the interval
+    was the floor on how fast a sequence of dialogs could be cleared.
+    """
     _require()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -495,6 +788,62 @@ def close_window(hwnd: int) -> None:
     win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 
 
+#: Keys that answer a dialog with no addressable buttons.
+_KEYS = {
+    "enter": 0x0D, "escape": 0x1B, "esc": 0x1B, "tab": 0x09,
+    "space": 0x20, "backspace": 0x08, "delete": 0x2E, "del": 0x2E,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74,
+    "f6": 0x75, "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79,
+    "f11": 0x7A, "f12": 0x7B,
+}
+
+#: Modifier virtual-key codes, held down around a key in a chord.
+_MODIFIERS = {"ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10}
+
+
+def press_key(hwnd: int, key: str) -> bool:
+    """Answer a dialog by keystroke, for the ones with NO button handles.
+
+    THE CASE THIS EXISTS FOR. Altium's newer dialogs are WPF, hosted in
+    an HwndWrapper window. Their buttons are not child windows, so
+    EnumChildWindows returns nothing, ``buttons()`` comes back empty and
+    ``click`` has no handle to address. MEASURED on the "Unsaved
+    Changes" prompt: the captions are readable only by OCR, and
+    app_press_dialog_button could do nothing but refuse while the bridge
+    stayed blocked for over two minutes.
+
+    A keystroke reaches it, because the dialog has keyboard focus while
+    it is modal. Enter takes the default button and Escape cancels,
+    which between them cover the confirm prompts that actually wedge
+    this bridge.
+
+    Unlike ``click`` this CANNOT be addressed to a specific control, so
+    it goes to the foreground window and the caller must have made the
+    dialog foreground first. That is the trade: it is less precise, and
+    it is the only thing that works when no handle exists.
+
+    Returns whether the key was sent, not whether the dialog obeyed.
+    Confirm with ``wait_for_close``.
+    """
+    _require()
+    code = _KEYS.get(key.lower())
+    if code is None:
+        raise ValueError(f"unsupported key {key!r}; use one of "
+                         f"{sorted(_KEYS)}")
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:                            # pragma: no cover - guard
+        # Windows refuses foreground changes from a background process
+        # in some states. The post below can still land if the dialog
+        # already has focus, so this is not fatal.
+        pass
+    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, code, 0)
+    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, code, 0)
+    return True
+
+
 def window_text_dump(window: Window, limit: int = 60) -> list:
     """Readable text from a window's controls, for the record.
 
@@ -511,3 +860,240 @@ def window_text_dump(window: Window, limit: int = 60) -> list:
         if len(seen) >= limit:
             break
     return seen
+
+
+def send_keys(sequence: str, hold: float = 0.03, target=None) -> dict:
+    """Send a key sequence to whatever has focus.
+
+    THE LAST GAP IN "ANY INPUT". Everything else here addresses a
+    control: a checkbox, a field, a row, a cell. Some things in Altium
+    take neither, they take a keystroke: a canvas shortcut, a grid that
+    commits on Enter, a dialog answered with Escape, a chord like
+    Ctrl+Shift+D.
+
+    Sequence is space separated, and each item is either a key name or a
+    chord joined by '+':
+
+        "escape"                 one key
+        "ctrl+s"                 a chord
+        "tab tab enter"          three keys in order
+
+    SENT TO THE FOCUSED WINDOW, not to a handle. That is the point of
+    it, and also the risk: whatever is focused receives this, so a
+    caller should establish focus first and check afterwards. Nothing
+    here can verify the effect, because a keystroke has no read-back;
+    the reply says what was sent, never that it worked.
+    """
+    _require()
+    _gate("synthesised input")
+    items = [chunk for chunk in str(sequence or "").split() if chunk]
+    if not items:
+        return {"ok": False, "reason": "no keys given"}
+
+    user32 = ctypes.windll.user32
+    sent = []
+    for item in items:
+        parts = [p.strip().lower() for p in item.split("+") if p.strip()]
+        if not parts:
+            continue
+        *mods, key = parts
+        codes = []
+        for mod in mods:
+            if mod not in _MODIFIERS:
+                return {"ok": False, "reason": (
+                    f"{mod!r} is not a modifier. Known: "
+                    f"{', '.join(sorted(set(_MODIFIERS)))}")}
+            codes.append(_MODIFIERS[mod])
+        if key not in _KEYS:
+            return {"ok": False, "reason": (
+                f"{key!r} is not a known key. Known: "
+                f"{', '.join(sorted(_KEYS))}"), "sent": sent}
+
+        for code in codes:
+            if target is not None:
+                require_foreground(target, f"the chord for {item!r}")
+            user32.keybd_event(code, 0, 0, 0)
+        if target is not None:
+            require_foreground(target, f"the key {key!r}")
+        user32.keybd_event(_KEYS[key], 0, 0, 0)
+        time.sleep(hold)
+        # Re-checked before the release: a key held down while focus
+        # moves releases into whatever became active.
+        if target is not None:
+            require_foreground(target, f"releasing {key!r}")
+        user32.keybd_event(_KEYS[key], 0, 2, 0)
+        for code in reversed(codes):
+            user32.keybd_event(code, 0, 2, 0)
+        sent.append(item)
+
+    return {"ok": True, "sent": sent, "note": (
+        "sent to whatever had focus. A keystroke has no read-back, so "
+        "this reports what was sent and not what it did")}
+
+
+def type_text(text: str, target=None) -> dict:
+    """Type literal text into the focused control, character by character.
+
+    Uses WM_CHAR-style unit input rather than a key table, so it carries
+    punctuation and case without needing a virtual-key code for every
+    character. For a field with a handle, controls.set_text is better:
+    it addresses the control and reads the value back. This is for the
+    places that have no handle to address.
+    """
+    _require()
+    _gate("synthesised input")
+    if not str(text or ""):
+        return {"ok": False, "reason": "no text given"}
+
+    user32 = ctypes.windll.user32
+    for char in str(text):
+        code = ord(char)
+        # KEYEVENTF_UNICODE, with the character in wScan.
+        if target is not None:
+            require_foreground(target, "a typed character")
+        user32.keybd_event(0, code, 0x0004, 0)
+        user32.keybd_event(0, code, 0x0004 | 0x0002, 0)
+    return {"ok": True, "typed": len(str(text)), "note": (
+        "typed into whatever had focus, with no read-back. Prefer "
+        "app_set_dialog_control for a field that has a handle")}
+
+
+#: Mouse event flags. Absolute coordinates are normalised to 0..65535
+#: across the virtual desktop, which is the only form that works on a
+#: multi-monitor setup.
+_ME_MOVE, _ME_ABSOLUTE = 0x0001, 0x8000
+_ME_LDOWN, _ME_LUP = 0x0002, 0x0004
+_SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 78, 79
+
+
+def _to_absolute(x: int, y: int):
+    user32 = ctypes.windll.user32
+    width = user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN) or 1
+    height = user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN) or 1
+    return int(x * 65535 / width), int(y * 65535 / height)
+
+
+def drag(x1: int, y1: int, x2: int, y2: int, steps: int = 12, target=None,
+         hold: float = 0.05) -> dict:
+    """Press at one point, move, release at another.
+
+    THE CANVAS TAKES NEITHER A CONTROL NOR A MENU. Placing, moving,
+    rubber-band selecting and routing are all pointer gestures, and
+    nothing here could make one: every existing action addresses a named
+    control, and the canvas has no named controls at all.
+
+    Moved in steps rather than jumped, because a jump from press to
+    release reads as a click at the destination in most editors: the
+    intermediate motion is what makes it a drag.
+
+    NO READ-BACK EXISTS FOR THIS. The reply says what gesture was made,
+    never what it did. Check the result with the bridge, which can see
+    the document, rather than believing this.
+    """
+    _require()
+    _gate("synthesised input")
+    user32 = ctypes.windll.user32
+    point = wintypes.POINT()
+    user32.GetCursorPos(byref(point))
+    origin = (point.x, point.y)
+
+    ax, ay = _to_absolute(int(x1), int(y1))
+    if target is not None:
+        require_foreground(target, "a drag move")
+        # BOTH ENDS are checked. Windows captures the mouse to whatever
+        # received the button-down, so the points in between cannot be
+        # delivered elsewhere, but the release can be.
+        require_point_in_app(int(x1), int(y1), target, "a drag start")
+        require_point_in_app(int(x2), int(y2), target, "a drag end")
+    user32.mouse_event(_ME_MOVE | _ME_ABSOLUTE, ax, ay, 0, 0)
+    time.sleep(hold)
+    if target is not None:
+        require_foreground(target, "a drag press")
+    user32.mouse_event(_ME_LDOWN, 0, 0, 0, 0)
+    time.sleep(hold)
+
+    steps = max(2, int(steps))
+    for i in range(1, steps + 1):
+        ix = int(x1 + (x2 - x1) * i / steps)
+        iy = int(y1 + (y2 - y1) * i / steps)
+        mx, my = _to_absolute(ix, iy)
+        # Every step of the path, not just the press: a drag that
+        # wanders while focus changes is drawing in another window.
+        if target is not None:
+            require_foreground(target, "a drag move")
+        user32.mouse_event(_ME_MOVE | _ME_ABSOLUTE, mx, my, 0, 0)
+        time.sleep(hold / 2)
+
+    # A drag holds the button down across many events, so losing focus
+    # mid-gesture would drop it somewhere else entirely. Released only
+    # while the target is still active.
+    if target is not None:
+        require_foreground(target, "a drag release")
+    user32.mouse_event(_ME_LUP, 0, 0, 0, 0)
+    user32.SetCursorPos(*origin)
+    return {"ok": True, "from": [int(x1), int(y1)], "to": [int(x2), int(y2)],
+            "steps": steps, "note": (
+                "a pointer gesture has no read-back. Confirm the effect "
+                "with a bridge read, which can see the document")}
+
+
+def click_at(x: int, y: int, double: bool = False, target=None) -> dict:
+    """A plain left click at a screen point, for the canvas.
+
+    Everything else clicks a control it found by name. This clicks where
+    it is told, which is the only way to reach a point on a drawing.
+    """
+    _require()
+    _gate("synthesised input")
+    user32 = ctypes.windll.user32
+    point = wintypes.POINT()
+    user32.GetCursorPos(byref(point))
+    origin = (point.x, point.y)
+
+    ax, ay = _to_absolute(int(x), int(y))
+    if target is not None:
+        require_foreground(target, "a pointer move")
+        require_point_in_app(int(x), int(y), target, "a click")
+    user32.mouse_event(_ME_MOVE | _ME_ABSOLUTE, ax, ay, 0, 0)
+    time.sleep(0.05)
+    for _ in range(2 if double else 1):
+        if target is not None:
+            require_foreground(target, "a click")
+        user32.mouse_event(_ME_LDOWN, 0, 0, 0, 0)
+        time.sleep(0.04)
+        if target is not None:
+            require_foreground(target, "a click release")
+        user32.mouse_event(_ME_LUP, 0, 0, 0, 0)
+        time.sleep(0.04)
+    user32.SetCursorPos(*origin)
+    return {"ok": True, "at": [int(x), int(y)], "double": bool(double),
+            "note": "no read-back; confirm with a bridge read"}
+
+
+def wait_for_dialog(pid: int, title: str = "", timeout: float = 30.0) -> dict:
+    """Block until a dialog appears, and report which one.
+
+    A COMMAND THAT RAISES A DIALOG RETURNS BEFORE THE DIALOG EXISTS, so
+    a caller that acted and then looked found nothing and concluded no
+    dialog was coming. The only alternative was a fixed sleep long
+    enough to be safe, which is the pattern this layer has spent the day
+    removing.
+    """
+    _require()
+    found = {}
+
+    def appeared() -> bool:
+        for dialog in dialogs(pid):
+            if not title or title.lower() in (dialog.title or "").lower():
+                found["dialog"] = dialog
+                return True
+        return False
+
+    if not wait_until(appeared, timeout):
+        which = f" matching {title!r}" if title else ""
+        return {"ok": False, "waited": timeout,
+                "reason": f"no dialog{which} appeared within {timeout:g}s"}
+    dialog = found["dialog"]
+    return {"ok": True, "title": dialog.title, "class": dialog.class_name,
+            "hwnd": dialog.hwnd,
+            "buttons": [b.text for b in dialog.buttons()]}

@@ -66,6 +66,9 @@ class EmitResult:
     bus_entries_emitted: int = 0
     failures: list[EmitFailure] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Set by `emit_canvas_delta`: which components were added, moved,
+    #: removed and left alone. Empty on a full emit, which touches all.
+    delta: dict = field(default_factory=dict)
 
 
 def emit_canvas(
@@ -201,6 +204,231 @@ def _ensure_sheet_loaded(
     return sheet_path
 
 
+#: Object types that make up a sheet's COPPER, as opposed to its parts.
+#: A delta emit clears and redraws these wholesale: they are cheap to
+#: place, they carry no user-owned state (a wire has no designator, no
+#: parameters, no lock), and identifying an individual segment through
+#: the filter syntax is not reliable enough to diff them one by one.
+_COPPER_TYPES = ("eWire", "eJunction", "eNetLabel", "ePowerObject",
+                 "eBus", "eBusEntry")
+
+
+def emit_canvas_delta(
+    canvas: SchematicCanvas,
+    snapshot: dict,
+    project_path: str,
+    bridge: Any,
+    *,
+    parameter_stamps: Optional[dict[str, dict[str, str]]] = None,
+) -> EmitResult:
+    """Bring an existing sheet to ``canvas``, touching only what differs.
+
+    ``emit_canvas`` transcribes a whole canvas onto a fresh-or-reused
+    project, which re-places every component. On a sheet somebody has
+    worked on that throws away what makes the component theirs: locked
+    designators, stamped parameters, hand-set properties. This moves the
+    parts that moved, places the ones that are new, deletes the ones that
+    went, and leaves every other component untouched.
+
+    COPPER IS REDRAWN, NOT DIFFED. Wires, junctions, labels, ports, buses
+    and bus entries are cleared and re-emitted from the canvas. They hold
+    no user-owned state and the filter syntax cannot address one segment
+    among many reliably, so a per-segment diff would be guesswork; a
+    redraw is exact. The expensive, lossy half is the components, and
+    that half is a true delta.
+
+    ``snapshot`` is the ``canvas`` dict from ``<project>.canvas.json``,
+    which is what says where each refdes was left.
+
+    ONE SHEET ONLY. Every command here runs against the ACTIVE document,
+    so the sheet is opened and activated first and a multi-sheet canvas
+    is refused rather than half-applied to whichever sheet happened to
+    be sheet zero.
+    """
+    result = EmitResult(project_path=project_path)
+    if len(canvas.sheets) > 1:
+        result.ok = False
+        result.notes.append(
+            f"delta emit takes one sheet; this canvas has "
+            f"{len(canvas.sheets)}: "
+            f"{', '.join(s.name for s in canvas.sheets)}"
+        )
+        return result
+    sheet_name = canvas.sheets[0].name if canvas.sheets else "main"
+
+    # Everything below filters on "active_doc". Without this the delta
+    # lands on whatever document Altium happens to have focused, and
+    # reports success for edits to a sheet nobody asked about.
+    sheet_path = _ensure_sheet_loaded(Path(project_path), sheet_name,
+                                      bridge, result)
+    if sheet_path is None:
+        return result
+    try:
+        bridge.send_command("application.set_active_document",
+                            {"file_path": str(sheet_path)})
+        result.sheets_emitted.append(sheet_name)
+    except Exception as exc:                    # noqa: BLE001
+        result.ok = False
+        result.notes.append(f"set_active_document {sheet_name} failed: {exc}")
+        return result
+
+    # BOTH SIDES ARE FILTERED TO THIS SHEET. A project snapshot holds
+    # every sheet's instances, and comparing all of them against one
+    # sheet's canvas reports every part of every other sheet as removed.
+    # The deletes that follows are scoped to the active document and so
+    # would match nothing, but the delta would say parts went that are
+    # still there. A snapshot instance with no sheet recorded is taken
+    # as this one, which is what a single-sheet snapshot looks like.
+    was = {
+        i.get("refdes"): i
+        for i in (snapshot or {}).get("instances", [])
+        if i.get("refdes") and i.get("sheet", sheet_name) == sheet_name
+    }
+    now = {i.refdes: i for i in canvas.instances_on(sheet_name)}
+
+    # A REFDES WHOSE SYMBOL CHANGED IS NOT THE SAME PART. The plan can
+    # swap what R1 is, and moving the old symbol to the new coordinate
+    # would leave the sheet holding a part the plan no longer contains,
+    # wired as if it were the new one. Replace it instead.
+    def _swapped(refdes: str) -> bool:
+        old, new = was[refdes], now[refdes]
+        return (str(old.get("lib_ref", "")) != new.symbol.lib_ref
+                or str(old.get("lib_path", "")) != new.symbol.lib_path)
+
+    both = set(now) & set(was)
+    swapped = sorted(r for r in both if _swapped(r))
+    added = [now[r] for r in sorted((set(now) - set(was)) | set(swapped))]
+    removed = sorted((set(was) - set(now)) | set(swapped))
+    both -= set(swapped)
+    moved = [
+        now[r] for r in sorted(both)
+        if (int(was[r].get("x", 0)) != now[r].x
+            or int(was[r].get("y", 0)) != now[r].y
+            or int(was[r].get("rotation", 0)) % 360 != now[r].rotation % 360)
+    ]
+
+    for refdes in removed:
+        try:
+            bridge.send_command("generic.delete_objects", {
+                "scope": "active_doc", "object_type": "eSchComponent",
+                "filter": f"Designator={refdes}"})
+        except Exception as exc:                # noqa: BLE001
+            result.ok = False
+            result.failures.append(EmitFailure(
+                refdes=refdes, code="DELETE_FAILED",
+                reason=f"delete raised: {exc}"))
+
+    for inst in moved:
+        # ORIENTATION FIRST, LOCATION SECOND, as two ops. Measured on a
+        # pin: a combined `Location.X=..|Orientation=..` applied the
+        # location and dropped the orientation, because writing Location
+        # triggers a re-layout that can snapshot the previous value.
+        # SetSchProperty in Generic.pas carries that note and prescribes
+        # the split; ApplySetProperties still coalesces Location into a
+        # first pass and applies everything else after it, which is the
+        # unsafe order. Both ops here filter on the designator, which
+        # does not change, so neither has to chase a moved coordinate.
+        try:
+            if int(was[inst.refdes].get("rotation", 0)) % 360 != inst.rotation % 360:
+                bridge.send_command("generic.modify_objects", {
+                    "scope": "active_doc", "object_type": "eSchComponent",
+                    "filter": f"Designator={inst.refdes}",
+                    "set": f"Orientation={(inst.rotation % 360) // 90}"})
+            bridge.send_command("generic.modify_objects", {
+                "scope": "active_doc", "object_type": "eSchComponent",
+                "filter": f"Designator={inst.refdes}",
+                "set": f"Location.X={inst.x}|Location.Y={inst.y}"})
+        except Exception as exc:                # noqa: BLE001
+            result.ok = False
+            result.failures.append(EmitFailure(
+                refdes=inst.refdes, code="MOVE_FAILED",
+                reason=f"move raised: {exc}"))
+
+    if added:
+        _emit_placements(added, bridge, result)
+    # Stamp only the parts that are NEW. A part that merely moved keeps
+    # whatever parameters it has on the sheet, which is the point of a
+    # delta: re-stamping would overwrite a value somebody edited by hand.
+    if added and parameter_stamps:
+        _emit_parameter_stamps(added, parameter_stamps, sheet_path, bridge,
+                               result)
+    # TEXT POSITIONS FOLLOW THE MOVE, unlike the stamps. Gen_SetSchTextPositions
+    # writes the designator and comment at an ABSOLUTE sheet coordinate with
+    # Autoposition off, so a part that moves leaves its own designator behind
+    # on the sheet until this runs for it too.
+    if added or moved:
+        _emit_text_positions(added + moved, sheet_path, bridge, result)
+
+    for object_type in _COPPER_TYPES:
+        try:
+            # An empty filter matches every object of the type, which
+            # is what clearing the copper means. confirm_delete_all is
+            # a guard on the TOOL, not a parameter the handler reads;
+            # sending it here only looked like a safety belt.
+            bridge.send_command("generic.delete_objects", {
+                "scope": "active_doc", "object_type": object_type,
+                "filter": ""})
+        except Exception as exc:                # noqa: BLE001
+            result.failures.append(EmitFailure(
+                refdes="", code="CLEAR_FAILED",
+                reason=f"clearing {object_type} raised: {exc}"))
+
+    _emit_wires(list(canvas.wires_on(sheet_name)), bridge, result, sheet_name)
+    _emit_labels([l for l in canvas.labels if l.sheet == sheet_name],
+                 bridge, result, sheet_name)
+    _emit_power_ports([p for p in canvas.power_ports if p.sheet == sheet_name],
+                      bridge, result, sheet_name)
+    _emit_junctions([j for j in canvas.junctions if j.sheet == sheet_name],
+                    bridge, result, sheet_name)
+    _emit_buses([b for b in canvas.buses if b.sheet == sheet_name],
+                bridge, result, sheet_name)
+    _emit_bus_entries([e for e in canvas.bus_entries if e.sheet == sheet_name],
+                      bridge, result, sheet_name)
+
+    result.delta = {
+        "added": [i.refdes for i in added],
+        "moved": [i.refdes for i in moved],
+        "removed": removed,
+        "untouched": sorted(both - {i.refdes for i in moved}),
+        "replaced": swapped,
+    }
+    return result
+
+
+def _emit_sheet_size(
+    canvas: SchematicCanvas, sheet_name: str, bridge: Any, result: EmitResult
+) -> None:
+    """Put the plan's paper on the document before anything is drawn.
+
+    THE PLACER ALREADY SIZED TO IT. sheet_bounds spreads a layout across
+    the sheet the plan declares, so a plan asking for A3 is laid out to
+    A3 and, on a document nobody resized, drawn past the edge of an A4
+    frame. Nothing failed and nothing said so: the parts are all there,
+    the netlist is right, and the border is in the wrong place.
+
+    Set BEFORE placing, because the size is a document property and
+    changing it afterwards would move the frame under parts already
+    positioned against it.
+
+    A4 is skipped because it is what a new document already is, which
+    keeps the common case at zero extra calls, and a failure is a note
+    rather than an abort: the sheet is still correct, only its border is
+    the wrong size.
+    """
+    sheet = next((s for s in canvas.sheets if s.name == sheet_name), None)
+    size = (getattr(sheet, "size", "") or "").strip()
+    if not size or size.upper() == "A4":
+        return
+    try:
+        bridge.send_command("generic.set_sheet_size", {"style": size})
+        result.notes.append(f"sheet {sheet_name}: size set to {size}")
+    except Exception as exc:                    # noqa: BLE001
+        result.notes.append(
+            f"sheet {sheet_name}: could not set size to {size} ({exc}); the "
+            f"layout was computed for {size} and the border is still the "
+            f"document default")
+
+
 def _emit_sheet(
     canvas: SchematicCanvas,
     sheet_name: str,
@@ -222,6 +450,8 @@ def _emit_sheet(
     except Exception as exc:
         result.notes.append(f"set_active_document {sheet_name} failed: {exc}")
         return
+
+    _emit_sheet_size(canvas, sheet_name, bridge, result)
 
     # 1. Bulk place components.
     instances = canvas.instances_on(sheet_name)

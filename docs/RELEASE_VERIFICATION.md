@@ -1,4 +1,4 @@
-# Release verification: 2026.08.18.3
+# Release verification: 2026.09.23.4
 
 Everything below is Pascal that FPC and the linter have checked and that
 **Altium's DelphiScript engine has never executed**. The two are not the
@@ -17,13 +17,21 @@ works elsewhere cannot be an undeclared identifier:
 
 | Step | Property | Written elsewhere? | Risk |
 |---|---|---|---|
-| 5, 3D placement | `StandoffHeight` | no, nowhere | highest |
+| 5, 3D placement | `StandoffHeight` | only by step 15, itself unverified | highest |
 | 5, 3D placement | `Rotation` on a body | other object types only | high |
 | 2, pin edges | `Symbol_OuterEdge`, `Symbol_InnerEdge` | no, nowhere | high, and can stop the loop |
 | 7, enum words | `StrToPinElectrical` | yes, `Lib_AddPins` | medium |
 | 4, DNP paste | `PasteMaskExpansion` | yes, `PCB_MakePasteGrid` | low, but it edits the board |
 | 3, filled body | `AreaColor`, `IsSolid` | yes, `Generic.pas` | low |
 | 5, 3D placement | `MoveByXY` | yes, `PCB_ReplicateLayout` | low |
+| 11, copy and rename | `LibReference` | yes, `Lib_CreateSymbol` | low |
+| 12, delete variant | `DM_RemoveProjectVariant` | no, nowhere | highest, and it destroys work |
+| 13, sheet symbol filename | `Text` on a sheet symbol's sub-object | yes, on other objects | medium |
+| 14, polygon pour options | `RemoveDead`, `RemoveNarrowNecks`, `RemoveIslandsByArea` | new here, and in two places at once | high, and it can stop the loop |
+| 15, 3D body on a board | `StandoffHeight` on a free body | only by step 5, itself unverified | highest, shared with step 5 |
+| 16, region kind | `Kind` on a region | read by four reference scripts, written by none | high, and it can stop the loop |
+| 17, component UniqueId | `UniqueId` on a placed component | no, nowhere | highest, and a wrong id costs the next Update PCB |
+| 18, pin owner part | `OwnerPartId` | yes, by two independent reference scripts | medium, behavioural not declarative |
 | 6, mirrored text | `MirrorFlag` | yes, `PCB.pas` | lowest |
 
 Steps 5 and 2 are the ones that justify a live session. The bottom rows
@@ -38,6 +46,10 @@ there would be behavioural: whether moving a group moves its children.
 a body, and DelphiScript resolves a property against the object in hand,
 so another interface accepting it proves nothing here. Only
 `StandoffHeight` is entirely unexercised.
+
+Two steps now write `StandoffHeight` and neither has run, so they do not
+vouch for each other: steps 5 and 15 share one unproven identifier. Run
+whichever is easier and the other drops to a behavioural check.
 
 ### What this release adds, and why it is a different kind of risk
 
@@ -60,6 +72,25 @@ refusal is deliberately absent from `Proj_UpdateSchematic`, the
 opposite direction, because the focus Altium wants there has never been
 measured. If you exercise that direction, record what it does.
 
+Footprint height is the same shape of risk, which is to say almost
+none. `Lib_SetFootprintHeight` writes `Footprint.Height`, which the
+height sweep beside it has always written, and reads the library
+through the same iterator thirty-odd other handlers use. What is new is
+a DIRECTION: the sweep can now lower a height to the model, not only
+raise it. Check it by setting a footprint absurdly tall by hand, running
+the sweep in `match` mode, and confirming it comes back down. Confirm
+the reverse too, that `raise` leaves it alone, because a mode that
+ignores its argument would pass the first test on its own.
+
+The case worth being careful about is a footprint with NO 3D body. It
+must not be written at all. Writing the 0 that an absent model implies
+does not relax placement-collision DRC, it disables it for that part,
+and doing that across every unmodelled footprint would switch the rule
+off wholesale while reporting a clean sweep. Run `match` on a library
+where at least one footprint has no model, and check that footprint's
+height is untouched and that its name comes back under
+`without_model_names`.
+
 What it adds instead is **logic that decides what to touch**, which
 fails silently rather than loudly:
 
@@ -71,11 +102,80 @@ fails silently rather than loudly:
 | Library parameter delete | Matches zero and reports success | Delete a named parameter from a library symbol, then read the symbol's parameters |
 | Multi-part scope suffix | Returns part one's pins under another part's name | `lib_get_pin_list` on a multi-part symbol with `@2` and `@3`, and compare the counts |
 | Cross-document hints | The hint is appended to an error it does not apply to, or doubles up on a message that already names a tool | Focus a SchDoc and run `pcb_delete_object`. The refusal must name the PCB tool once, and read as one sentence |
+| Refusals name the focused document | A wrong-document refusal says what is missing and not what is there, so the caller goes looking for whatever took the focus | Focus a SchLib and run `sch_place_components`. The refusal must name the .SchLib by file name only, no folder, and still carry the `lib_` hint once. Name the library something containing `lib_` and repeat: the hint must still appear |
 
 None of these can halt the polling loop the way an undeclared
 identifier does, so they are safe to run in any order and safe to run
 last. The cost of getting one wrong is a wrong answer, not a dead
 bridge.
+
+### Carried into 2026.09.23.4: five fixes whose symptom was silence
+
+These came out of one live session and a bug report, and they share a
+shape: the tool reported success, the board or sheet did not agree, and
+nothing anywhere said so. A guard test covers each one against the
+source, which is not the same as having watched it work.
+
+| Fixed | What it did before | How you would know it is fixed |
+|---|---|---|
+| Component movers use `MoveByXY` | Assigning `Comp.x` moved the record and left every pad where it was, so the pour kept clearing the old footprint and the DRC kept measuring it | Move a placed component with `pcb_move_components`, then `pcb_repour_polygons`. The copper must clear the NEW position and nothing at the old one |
+| Placed copper joins its net | `Prim.Net := N` sets a reference, but the net keeps its own collection and connectivity, the ratsnest and the pour all walk that one. Copper had a net, reported that net, and was invisible to everything downstream | `pcb_place_via` on a named net, then `pcb_get_unrouted_nets`. The via must count as connected, and a pour on that net must give it thermal relief |
+| Schematic writes mark the document | A write that does not set the modified flag is invisible to `SmartCompile`, which checks `ProjectHasDirtyDocs` and skips. Symptom: ERC and the netlist keep reporting the state before your edit until the sheet is reopened | Place something with `sch_place_no_erc`, then `app_context`. The sheet must appear in `unsaved`, and `proj_run_erc` must see the edit without a reopen |
+| Position reads resolve per type | `GetPCBProperty` read `Obj.x` off the declared `IPCB_Primitive`. A type that does not publish it raised "Undeclared identifier: x", which the engine shows as a modal before any `Try/Except` runs, stopping the polling loop | `obj_query` a text object's position, then an arc's. Both must answer, and a track must come back `unreadable` rather than with one of its ends |
+| `app_context` can see unsaved work | It filtered the open-document list on a `modified` key the handler never emitted, so the list was always empty and every session opened reporting itself clean | Edit any sheet without saving, then `app_context`. `unsaved` must name it |
+
+`pcb_set_via_soldermask_relief` refuses on this build rather than being
+fixed. The write raises an access violation inside
+`ScriptingSystem.DLL` on AD 26.10.1.6, measured twice on a scratch
+board with three vias and nothing else, once through `BeginModify` and
+once through `SendMessageToRobots`. Because the fault lands between
+`PreProcess` and `PostProcess` it also leaves an open transaction
+behind it.
+
+The refusal is in the PYTHON tool, and that is the half to check.
+Reaching the handler means putting the command on the wire, and any
+session running a deployed script from before the refusal landed still has the
+crashing write in it. Confirm the tool answers `NOT_SCRIPTABLE`
+instantly and that `bridge_trace.log` shows no request for it.
+
+### Three new design-rule kinds, and these DO carry identifier risk
+
+Unlike everything else in this release, these write Altium symbols this
+codebase has never used. Run them before anything else in a session you
+mind losing, because an undeclared identifier here stops the polling
+loop rather than returning an error.
+
+| `rule_type` | Symbols | Evidence they exist | How to check |
+|---|---|---|---|
+| `paste_mask_expansion` | `eRule_PasteMaskExpansion`, `IPCB_PasteMaskExpansionRule.Expansion` | `NofittedNoPaste.pas` in the reference corpus creates one exactly this way | Create one, then read it back with `pcb_get_design_rules` and look at `descriptor`, not `rule_kind`, which is a raw enum ordinal |
+| `solder_mask_expansion` | `eRule_SolderMaskExpansion`, `IPCB_SolderMaskExpansionRule.Expansion` | enum used by three reference scripts; interface and property in the SDK reference. The FACTORY call is unproven | Create with `scope="IsVia"` and a negative value, then look at the mask layer over a via |
+| `vias_under_smd` | `eRule_ViasUnderSMD`, `IPCB_ViasUnderSMDConstraint.Allowed` | same: enum used by three reference scripts, interface and property documented, factory call unproven | Create with `allowed=false`, place a via inside an SMD pad, run DRC |
+
+`paste_mask_expansion` is the one to run first. It is the only one of
+the three whose factory call is demonstrated by working published code,
+so if it fails the problem is this handler rather than the symbol, and
+if it succeeds the other two are down to their own enum values.
+
+These close the gap the via-relief refusal used to point at: tenting is
+a Solder Mask Expansion rule scoped `IsVia`, and via-in-pad is caught
+by Vias Under SMD. Both were previously "set it in the dialog".
+
+### Close without saving, and OutJob runs that wrote nothing
+
+Two handler changes. Neither adds an identifier this codebase has not
+already called, so the risk is behavioural rather than a halted loop.
+Run both on a scratch project, never a client one: the first one is
+built to throw edits away.
+
+| Changed | What is unmeasured | How to check |
+|---|---|---|
+| `Proj_Close` with `save=false` clears each loaded member's modified flag before closing, without reading it | MEASURED on this build, local scratch project: the tab showed the sheet modified, the close raised no prompt, `attempts` was 1, and the file on disk was byte-identical afterwards. On the previous build the clear was gated on a read that returned False, and the close prompted. A managed project is untested | On a managed project, edit a sheet without saving, then `proj_close(project_path=..., save=False)`. Record whether a prompt appears |
+| If a prompt appears anyway, `proj_close` answers it: Save None, then OK once the title reads "Confirm Not Saving" | The sequence was MEASURED on the previous build with `app_invoke_element`. The tool running it has not run live, because on this build the prompt did not appear | Only reachable where the step above still prompts. The reply then carries `prompts_answered` |
+| It presses nothing when the prompt lists a document outside the project | Unmeasured | Do not arrange it on a project with real work open |
+| `App_GetActiveDocument` and `Proj_GetDocuments` put a path in `file_path` | MEASURED: the previous build reported the bare file name from both, and this build reports absolute paths from both | Done |
+| A close without saving that stays open is retried once | MEASURED on the previous build, and misread at first: `attempts: 2` on an unmodified scratch project was not the retry doing its job. The first close had closed a different project, the focused one | See the next row |
+| `Proj_Close` focuses the named project before closing, refuses when it cannot, and stops without retrying when anything else closes | MEASURED on the previous build: `CloseObject` given a project's full path closed the FOCUSED project instead, and nothing reported it. This build's guard is unmeasured | Open two scratch projects, each with a loaded sheet. Focus a sheet of the first, then `proj_close` the second: only the second may close, and `closed_instead` must be empty. Then `proj_close` a project with no loaded document: it must refuse and close nothing |
+| `Proj_RunOutJob` replies `process_issued`, and the Python tools decide `success` from the output folder | Nothing Altium-side | Run a container with its outputs switched off: `proj_run_outjob` must return `success: false` with a `reason`. Run one that writes: `files_written` must be above zero |
 
 ---
 
@@ -108,8 +208,8 @@ objects you can delete afterwards.
 app_ping
 ```
 
-Expect `altium_script_version` = `2026.08.18.3`, `version_match` =
-`true`, and `mcp_server_version` = `0.5.0`.
+Expect `altium_script_version` = `2026.09.23.4`, `version_match` =
+`true`, and `mcp_server_version` = `0.6.1`.
 
 Those are two different versions and they fail differently.
 `altium_script_version` is the Pascal that Altium compiled;
@@ -152,7 +252,14 @@ and the next healthy loop consumes them.
 
 ## 1. Pure logic, no document needed
 
-**File > Run Script... > SelfTest > RunSelfTest**
+`RunSelfTest` is no longer listed in the Run Script dialog. It carries a
+dummy argument like every other internal routine, so the dialog offers
+the one thing a user does: start the bridge. To run the self test,
+temporarily drop the argument from `Procedure RunSelfTest(Dummy : Integer)`
+in `SelfTest.pas`, reload the project, and pick it from the dialog.
+
+It also ends in `ShowMessage`, so it cannot be reached over the bridge
+without splitting the summary out first.
 
 Expect `Failed: 0`. The log is written to the workspace directory.
 
@@ -505,6 +612,22 @@ The loop is bounded by `PartCount` because the command wraps at the
 last part. A target that can never be reached leaves the editor moved
 but not where asked, so check the spinner afterwards.
 
+**Part 1 goes a different way, new in 2026.09.23.4.** The command only
+steps forward and stops at the last part, so from part 3 there is no
+step back to part 1, and `@1` read whichever part was on screen.
+`@1` now selects some other component in the library and then this
+one again, which reopens it on part 1, and checks the pins it can see
+afterwards. None of that has run in Altium. Three checks:
+
+* Spinner on part 3 by hand, query `@1`. Part 1's pins, and the
+  spinner on part 1 afterwards.
+* The same in a library holding only that one component. It must
+  refuse and say in `next_step` that there is no other component to
+  reselect from, not answer with part 3's pins.
+* A scope with no suffix at all, `lib_component:<NAME>`, with the
+  spinner on part 2. It now reads part 2, the part on screen, and
+  leaves the spinner where it was. It used to be treated as `@1`.
+
 ---
 
 ## 10. UNC paths survive the trip (task #44)
@@ -528,6 +651,380 @@ must keep working unchanged, which step 9's queries already exercise.
 
 `tests/test_no_double_unescape.py` pins the site count at zero from
 now on, so this is a one-time verification, not a recurring step.
+
+## 11. Copy and rename actually change the library
+
+Reported against the previous script build: `lib_copy_component` and
+`lib_rename_component` both answered `success:true` while the component
+count did not move, the copy's `new_name` resolved nowhere, and the
+renamed part was still there under its old name.
+
+`AddSchComponent` overrides `LibReference` with an auto-generated
+`Component_<N>` on the second and later additions to a SchLib in one
+session, so an assignment made before the add does not survive it.
+`Lib_CreateSymbol` already re-asserts after the add for this reason;
+these two did not. No new identifiers are involved, so the compile risk
+is nil, and what needs proving is the behaviour.
+
+On a scratch library, with a symbol that is not the first added this
+session:
+
+    lib_copy_component    source_name <existing>  new_name COPY_PROBE
+    app_save_all
+    lib_get_components    library_path <the same library>
+
+`COPY_PROBE` must appear, and the count must be one higher. Then:
+
+    lib_rename_component  component_name COPY_PROBE  new_name RENAME_PROBE
+    app_save_all
+    lib_get_components    library_path <the same library>
+
+`RENAME_PROBE` must appear, `COPY_PROBE` must be gone, and the count
+must be unchanged.
+
+**Save before reading.** `lib_get_components` reads the FILE, so without
+the save these steps can only fail. And `verified:true` is not evidence
+of anything on disk: the handlers verify through `LookupLibComponent`,
+which returns the component this session last created or renamed by
+name, whether or not the library holds it.
+
+**What the previous builds did, live.** Copy and rename both answered
+`verified:true`, the library was saved, and the file kept the old name
+and never gained the copy. Each first asked whether the new name already
+existed, through the lookup that reopens the library on a miss, and a
+miss is the normal answer. The reopen saved, closed and reopened the
+library, so the handler went on to edit a component in a closed
+document, and every later save wrote the reopened library without the
+edit. `lib_batch_rename`, which never asks, persisted on the same
+scratch library. The existence checks now use a lookup that cannot
+reopen. That is the change these steps test.
+
+Note that `part_count` from `lib_get_components` is not evidence of
+anything here. It comes from the CompInfoReader, which has been measured
+reporting 2 for a symbol created single-part whose every pin carries
+`OwnerPartId 1`, while `lib_get_component_details` reported 1 for an
+identically created symbol.
+
+## 12. Deleting a project variant (highest risk in this release)
+
+`DM_RemoveProjectVariant` is the only write in Altium's entire variant
+API, and nothing in this codebase has ever called it, so it carries the
+undeclared-identifier risk in full: if the name is wrong it faults where
+`Try/Except` cannot catch it and takes the polling loop with it.
+
+It is also the only step here that destroys work which cannot be
+rebuilt from this bridge. A variant's entries record which components
+are not fitted and which carry an alternate part, and there is no
+documented way to add a variation entry back. Deleting a populated
+variant means re-making every one of those decisions in the Variant
+Management dialog.
+
+**Work on a copy of a project, or take an `app_checkpoint` first.**
+
+Create a throwaway variant in the Variant Management dialog, then:
+
+    proj_list_variants
+    proj_delete_variant   variant_name SCRATCH_VARIANT
+    proj_list_variants
+
+The reply must carry `verified: true`, `variant_count_after` one lower
+than before, and `entries_removed`. The second listing must not contain
+the name. If the loop stops answering instead, the identifier is not
+declared in DelphiScript and the reference is wrong about it; say so
+and the tool comes back out.
+
+Then check the refusals, which cost nothing: a name that does not exist
+must return `VARIANT_NOT_FOUND` and change no count, and an empty
+`variant_name` must return `MISSING_PARAMS`.
+
+`proj_set_active_variant` changed in the same release and is cheap to
+check alongside. It used to report success on the strength of the name
+existing, without asking which variant was actually current afterwards.
+Switch to a variant and confirm the reply carries `verified: true`;
+the failure reply now names `current_variant` so a switch that did not
+take is distinguishable from one that did.
+
+## 13. obj_modify stops reporting writes it did not make
+
+Measured on a live project: `obj_modify` was asked three times to set a
+sheet symbol's `FileName`, answered `matched:1, saved:true` each time,
+and wrote nothing. The property is readable and had no case in the
+writer, so each attempt was recorded as an unknown name in a diagnostic
+buffer that only `batch_modify` ever rendered. Nothing in the reply
+distinguished it from a real one, and an operator spent a session
+working around a rename that had never happened.
+
+`matched` counts what the FILTER selected. It never said anything about
+whether a write landed. Every modify reply now carries `properties`
+and an explicit `success`.
+
+The cheapest check needs no sheet symbol at all. On any open schematic:
+
+    obj_modify  object_type eNetLabel  filter <anything that matches one>
+                set NotAPropertyName=1
+
+That must come back `success:false` with `NotAPropertyName` under
+`properties.unknown`, and `matched` may still be 1. Before this release
+it returned `matched:1, saved:true` and nothing else.
+
+Then the real one, on a sheet symbol whose child sheet you do NOT mind
+re-pointing, or on a scratch copy of a project:
+
+    obj_query   object_type eSheetSymbol  properties Filename,UniqueId
+    obj_modify  object_type eSheetSymbol  filter UniqueId=<the id>
+                set Filename=SOMETHING_ELSE.SchDoc
+    obj_query   object_type eSheetSymbol  properties Filename,UniqueId
+
+The reply must be `success:true` with an empty `properties.unknown`,
+and the second query must show the new text. A write that does not
+stick now reports under `properties.failed`, because the setter reads
+the label back rather than trusting the assignment.
+
+**This re-points a symbol, it does not rename a sheet.** The filename
+lives in three places: this label, the file on disk, and the project's
+document list. Only Altium's **Sheet Symbol Actions > Rename Child
+Sheet** does all three, and it keeps the symbol's `UniqueId`, which is
+the project's handle for that sheet instance. Deleting and re-placing a
+symbol issues a new id, and the next Update PCB then proposes
+delete-and-re-add for every component on the sheet instead of matching
+them.
+
+## 14. Polygon pour options, and the PCB writer that never reported
+
+Three properties this codebase has never written, so this carries the
+undeclared-identifier risk in full. They are declared on `IPCB_Polygon`
+with both accessors:
+
+    Property RemoveDead : Boolean Read GetState_RemoveDead
+                                  Write SetState_RemoveDead;
+
+and the same shape for `RemoveNarrowNecks` and `RemoveIslandsByArea`.
+Reported from a live board as "not an exposed property on this API",
+which was a fair reading of a modify that answered `matched:2` and wrote
+nothing.
+
+**Nothing here repours.** These decide what the NEXT pour produces, so
+the copper does not change until `pcb_repour_polygons` runs. Check the
+flag first and the pour second, or a working change looks like a failed
+one.
+
+    pcb_get_polygons
+    pcb_modify_polygon  index 0  remove_dead true
+    pcb_get_polygons
+
+The reply must carry `changed: ["remove_dead"]`, `modified: true` and
+`repour_needed: true`. Then repour and confirm the dead copper goes.
+
+Set it back to `false` afterwards and confirm `changed` names it again:
+a handler that ignored the value and always wrote true would pass the
+first half on its own.
+
+Two refusals, which cost nothing and are the point of the release:
+
+    pcb_modify_polygon  index 0  hatch_style Horizontal
+    pcb_modify_polygon  index 0  net NO_SUCH_NET
+
+Both must come back with `success: false` and the field named under
+`not_applied`. `Horizontal` was documented by the tool and handled by no
+branch, so it changed nothing and reported success; a net name that
+matches nothing did the same.
+
+The PCB property writer also reports now, so the generic route says so
+too. On any board:
+
+    obj_modify  object_type ePolyObject  set NotAProperty=1
+
+must come back `success:false` with the name under
+`properties.unknown`. Before this it returned a bare `matched` count.
+
+## 15. A STEP model straight onto the board, and a read that stopped moving focus
+
+Two things from one session, and the second is why the first took so
+long to diagnose.
+
+**THIS TOOL HAS ALREADY CRASHED ALTIUM ONCE.** The first build set
+Layer, x, y and StandoffHeight on the body before adding it to the
+board, and the PCB engine went down with "Access violation ... Read of
+address 0x20" inside ADVPCB.DLL. A null dereference at a small field
+offset is a property setter reaching for state that an owning board
+provides. It also assigned x and y directly, where the reference and
+`Lib_Link3DModel` both use `MoveByXY` after the add.
+
+Both are corrected: add, register, then Layer, then MoveByXY, then
+StandoffHeight. Treat this step as unproven all the same, and take an
+`app_checkpoint` before running it.
+
+**`pcb_place_3d_body`** puts a STEP model on the open PcbDoc as a free
+3D body, which is Altium's Place > 3D Body > Generic STEP Model. Until
+now `lib_link_3d_model` was the only STEP importer in the toolset and it
+writes into a `.PcbLib` footprint, so putting a fixture or a
+device-under-test on a board meant inventing a library, authoring a
+footprint, placing it and deleting all of it again. The call sequence
+here is the one `Lib_Link3DModel` already uses, minus the footprint
+binding, so every identifier in it is exercised by shipped code.
+
+On a scratch board, with any `.step` to hand:
+
+    pcb_place_3d_body  model_path <path>  x 1000  y 1000  standoff_height 100
+    obj_switch_view    3d
+
+The reply's `x` and `y` are READ BACK from the placed body rather than
+echoed. Confirm `standoff_applied` is true, then look: the body must be
+visible and sitting 100 mils proud. `rotation_applied` is always false
+and says why in `note`.
+
+Then the refusals, which cost nothing:
+
+    pcb_place_3d_body  model_path C:\nope.step
+    pcb_place_3d_body  model_path <a .txt file>
+
+The first must be `FILE_NOT_FOUND` and the second `MODEL_LOAD_FAILED`.
+They are separated on purpose: the path is checked before anything is
+created, because `ModelFactory_FromFilename` on a missing file returns
+Nil and leaves an orphan body behind.
+
+**The focus fix has no visible output, so check it by its absence.**
+Nine read-only library actions used to leave the active document on the
+library they read, because focusing it is the only way the PCBServer and
+SchServer accessors will answer about it. Measured: `lib_probe_footprint`
+silently focused a PcbLib, and the `obj_switch_view 3d` that followed
+switched the LIBRARY into 3D. The board looked untouched and the model
+looked absent.
+
+With a PcbDoc focused:
+
+    lib_probe_footprint  library_path <some .PcbLib>  footprint_name <one>
+    app_get_active_document
+
+The active document must still be the PcbDoc. Try it with
+`lib_search`, `lib_get_component_details` and `lib_audit_styles` too;
+all nine are listed in `LibActionIsReadOnly`.
+
+Then confirm the opposite, which is the half that could regress
+silently: library WRITES must still leave the library focused, because
+authoring is a sequence of calls against a current component.
+
+    lib_set_current_component  <a symbol>
+    lib_add_pins               <a pin or two>
+
+The pins must land on that symbol. If they land nowhere, the restore has
+been applied to writes and the authoring flow is broken.
+
+## 16. A region's Kind, and board cutouts
+
+Reported from a live board as "the Board Cutout flag on a Region isn't
+reachable through this API". It is:
+
+    Property Kind : TRegionKind Read GetState_Kind Write SetState_Kind;
+
+and it had simply never been exposed, which is the third instance this
+release of a property being called absent because a reply said nothing.
+
+The five identifiers are attested rather than assumed: four independent
+scripts in `reference/` COMPARE against `eRegionKind_BoardCutout`,
+`_Cutout`, `_Copper`, `_NamedRegion` and `_Cavity`, so they exist in
+DelphiScript. None of them ASSIGNS one, so the write is unproven in the
+way `StandoffHeight` is. Read first, and take an `app_checkpoint` before
+writing.
+
+Words, not numbers, in both directions. The ordinals are undocumented,
+and publishing one invites a caller to write it back.
+
+On a board with an existing cutout:
+
+    obj_query   object_type eRegionObject  properties Kind,Layer
+
+At least one region must come back `board_cutout` or `cutout`. If every
+region reads `unknown`, the comparison is not matching and the write
+below must not be attempted.
+
+Then, on a scratch region you do not mind losing:
+
+    obj_modify  object_type eRegionObject  filter <one region>
+                set Kind=board_cutout
+    obj_query   object_type eRegionObject  properties Kind
+
+It must read back `board_cutout`, and the board outline must show the
+hole. An unknown word is refused rather than ignored:
+
+    obj_modify  object_type eRegionObject  filter <one>  set Kind=nonsense
+
+must come back `success:false` with `Kind` under `properties.unknown`.
+
+---
+
+## 17. Writing a component's UniqueId (highest risk in this release)
+
+`sch_set_component_unique_id` and `sch_replicate_component` both assign
+`ISch_Component.UniqueId`. Nothing in this repository wrote it before,
+and **no independent script in `reference/` writes it at all**, so the
+identifier is unattested. It is guarded with `Try/Except`, which is no
+guard: an undeclared identifier is not catchable in DelphiScript, so if
+the name is wrong the modal takes the polling loop down.
+
+It also carries a second risk that has nothing to do with whether the
+call works. **A UniqueId is the project's handle for a component.** Give
+one the wrong value and the next Update PCB stops matching that part and
+proposes delete-and-re-add for it instead, taking its placement and
+routing with it. That is a worse outcome than the tool failing.
+
+**Work on a copy of a project.** An `app_checkpoint` does not cover the
+PCB side of this.
+
+Read one first, so there is something to put back:
+
+    obj_query   object_type eSchComponent  filter Designator=<one>
+                properties UniqueId
+
+Then write the same value back to itself, which is the only edit here
+that cannot lose anything:
+
+    sch_set_component_unique_id  designator <the same>  unique_id <what it read>
+
+The reply must carry `success: true` and `unique_id_after` equal to what
+was asked. If the loop stops answering instead, the identifier is not
+declared and the tool comes back out.
+
+`success: false` with `unique_id_after` different is the OTHER outcome
+worth knowing: the call worked, Altium declined the assignment and kept
+its own id. That is a real answer, not a failure of the bridge, and it
+is what the comparison was added to surface.
+
+Only then try a component you do not mind re-annotating, and check with
+`proj_compare_sch_pcb` that the PCB still matches before and after.
+
+## 18. Moving a pin to another sub-part
+
+`lib_set_pin_owner_part` writes `OwnerPartId`, which two independent
+scripts in `reference/` also write, so unlike step 17 the identifier is
+attested and the risk is behavioural rather than declarative.
+
+The contributor stated plainly that this tool has never executed against
+a live Altium. Two things are worth checking because they fail quietly:
+
+    lib_get_pin_list        component_name <a multi-part symbol>
+    lib_set_pin_owner_part  component_name <the same>  pin_designators "3, 12"
+                            owner_part_id 2
+    lib_get_pin_list        component_name <the same>
+
+Both pins must come back with `owner_part_id` 2, and the count in the
+reply must be 2 rather than 1. The spaced form is deliberate: `"3, 12"`
+used to match nothing and report `count: 0` as a successful no-op.
+
+Then the bound, which is the one that corrupts rather than refuses:
+
+    lib_set_pin_owner_part  ...  owner_part_id 99
+
+must be refused. An id above the symbol's `PartCount` is accepted by the
+assignment and maps to no displayable part, so the pin vanishes from
+every sub-part view while the library still contains it.
+
+`owner_part_id 0` is Part Zero and is always legal: the pin is shared
+across all parts. Confirm it reads back as 0 rather than being treated
+as an error.
+
+Save with `app_save_all` and reopen the library before trusting any of
+it. A library edit is real in memory and absent from disk until then.
 
 ---
 

@@ -31,6 +31,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
+from eda_agent.atomicfile import discard, replace_with_retry
+
 logger = logging.getLogger("eda_agent.design.symbols")
 
 
@@ -308,8 +310,24 @@ class SymbolCache:
             )
             return None
 
-    def put(self, model: SymbolModel) -> None:
-        """Insert a model and persist the lib's cache file atomically."""
+    def put(self, model: SymbolModel,
+            source_mtime: Optional[float] = None) -> None:
+        """Insert a model and persist the lib's cache file atomically.
+
+        ``source_mtime`` is the library's mtime as observed BEFORE the
+        model was read out of it. Stamping the mtime found at write time
+        instead certifies the entry against a file the model may not
+        have come from: the library is reopened in the editor to answer
+        the read, and anything that touches it in that window (a
+        deferred save landing, an edit, another tool) moves the mtime.
+        The entry then reads as current for a symbol whose geometry is
+        one version behind, which is worse than a cache miss because
+        nothing reports it.
+
+        Falls back to the mtime at write time when the caller does not
+        supply one, which is the previous behaviour and is right for a
+        model built from something other than a live read.
+        """
         try:
             disk_mtime = Path(model.lib_path).stat().st_mtime
         except OSError as exc:
@@ -317,6 +335,17 @@ class SymbolCache:
                 "cannot stat %s, skipping cache write: %s", model.lib_path, exc
             )
             return
+        if source_mtime is not None:
+            if abs(source_mtime - disk_mtime) >= 0.001:
+                # The library moved under the read. Keep the model (the
+                # caller asked for it and will use it) but do not claim
+                # it is current, so the next run re-reads.
+                logger.info(
+                    "%s changed while %s was read; not caching it",
+                    model.lib_path, model.lib_ref,
+                )
+                return
+            disk_mtime = source_mtime
         data = self._load_lib(model.lib_path) or {
             "lib_mtime": disk_mtime,
             "components": {},
@@ -327,7 +356,23 @@ class SymbolCache:
         cache_file = self._lib_cache_path(model.lib_path)
         tmp = cache_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(cache_file)
+        # On Windows a scanner (Defender, a sync client, an indexer) can hold
+        # the freshly-written target open for a few ms, and os.replace then
+        # raises PermissionError. Retried in replace_with_retry; if it still
+        # will not go through, drop the cache entry rather than propagating.
+        # This cache is an optimisation, and losing a whole extraction run
+        # because a temp-file rename lost a race is never the right trade.
+        # put() rewrites this file once per symbol, so a 38-symbol run makes
+        # 38 attempts at the same target and any per-attempt failure rate
+        # compounds into near-certainty.
+        try:
+            replace_with_retry(tmp, cache_file)
+        except PermissionError:
+            logger.warning(
+                "symbol cache write for %s kept losing the rename race; "
+                "continuing without caching it", cache_file,
+            )
+            discard(tmp)
 
     def invalidate(self, lib_path: str) -> None:
         self._memory.pop(lib_path, None)
@@ -363,6 +408,12 @@ class SymbolExtractor:
         # target SchLib to be loaded in the editor. The handler reopens
         # the lib via WorkspaceManager:OpenObject if it isn't already
         # focused, so we don't need a separate load step here.
+        # Observed BEFORE the read, so put() can tell whether the library
+        # stayed still while Altium answered.
+        try:
+            source_mtime = Path(lib_path).stat().st_mtime
+        except OSError:
+            source_mtime = None
         try:
             response = self.bridge.send_command(
                 "library.get_component_details",
@@ -381,7 +432,7 @@ class SymbolExtractor:
             )
             return None
         model = parse_symbol_from_details(response, lib_path)
-        self.cache.put(model)
+        self.cache.put(model, source_mtime)
         return model
 
     def extract_many(

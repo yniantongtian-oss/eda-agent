@@ -312,10 +312,32 @@ class EasyEdaBridge:
         lowered = {k.lower(): v.lower() for k, v in headers.items()}
         if lowered.get("upgrade", "") != "websocket":
             if request_line.startswith("GET /health"):
+                # The connected builds are published here, not only in
+                # the diagnostics reply, because /health is the ONE
+                # observation an extension instance can make without a
+                # socket of its own.
+                #
+                # Measured: an instance reported "NOT connected,
+                # attempts 0, retry timer NOT ARMED" while this server
+                # showed the editor connected. Both were true. A
+                # mid-session re-import loads a second copy of the
+                # module, and the editor fires onStartupFinished only at
+                # startup, so the new copy serves the menu while the
+                # older copy keeps the socket. Module state can only
+                # ever describe the copy you are asking, and the copy
+                # you are asking is the one that did nothing.
+                #
+                # This server sees every copy, so it is the only place
+                # the question has an answer.
+                with self._lock:
+                    builds = sorted(
+                        {str(info["build"]) for info in self._conns.values()
+                         if info.get("build")})
                 body = json.dumps({
                     "service": SERVICE_ID,
                     "status": "ok",
                     "editor_connected": self.connected,
+                    "editor_builds": builds,
                 }).encode("utf-8")
                 conn.sendall(
                     b"HTTP/1.1 200 OK\r\n"

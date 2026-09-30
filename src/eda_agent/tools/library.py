@@ -12,6 +12,7 @@ from ..libimport import extract_cse_zip, inspect_cse_zip
 from .bulk_hints import BulkHintTracker
 from .datasheet_hints import tag_response
 from ..config import get_config
+from ..atomicfile import replace_with_retry
 
 
 def _encode_layer_ops(layers) -> "str | dict":
@@ -165,7 +166,7 @@ def write_designator_edits(workspace_dir, actions) -> tuple:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(body)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -430,6 +431,66 @@ def _safe_filename(name: str, fallback: str = "part") -> str:
     return safe_filename(name, fallback)
 
 
+def _spill_pin_list(result, pins, comp, output_path):
+    """Write the full pin array to JSON and summarise what is left.
+
+    A pin list that overflows the conversation is not merely awkward: the
+    client decides what survives, so the answer becomes environment
+    dependent. Writing the whole thing and returning a summary makes the
+    outcome the same everywhere, and the file is the more useful artefact
+    for the job people actually do with it, which is a field-by-field
+    comparison against the datasheet pin table.
+
+    The summary carries the two distributions worth eyeballing: pins per
+    part, and electrical type. Both are the checks that catch a symbol
+    built from a mis-transcribed table.
+    """
+    import json
+    from collections import Counter
+    from pathlib import Path
+
+    per_part = Counter()
+    per_type = Counter()
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        per_part[str(pin.get("owner_part_id", ""))] += 1
+        per_type[str(pin.get("electrical_type", ""))] += 1
+
+    if output_path:
+        target = Path(output_path)
+    else:
+        safe = "".join(c if c.isalnum() or c in "-_." else "_"
+                       for c in (comp or "symbol"))
+        target = Path(get_bridge().config.workspace_dir) / f"pins_{safe}.json"
+
+    written = ""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(pins, indent=1), encoding="utf-8")
+        written = str(target)
+    except OSError as exc:
+        # Never lose the data because the file could not be written.
+        # Returning it inline is worse than a file and better than
+        # nothing, and the reason has to travel with it.
+        out = dict(result)
+        out["spill_error"] = f"could not write {target}: {exc}"
+        return out
+
+    out = {k: v for k, v in result.items() if k != "pins"}
+    out["pins_path"] = written
+    out["summary"] = {
+        "pins": len(pins),
+        "per_part": dict(sorted(per_part.items())),
+        "per_electrical_type": dict(sorted(per_type.items())),
+    }
+    out["note"] = (
+        f"{len(pins)} pins written to {written}. Read or diff that file "
+        f"directly; it is not summarised further here."
+    )
+    return out
+
+
 def register_library_tools(mcp):
     """Register library tools with the MCP server."""
 
@@ -527,11 +588,13 @@ def register_library_tools(mcp):
         # straight into the string, so any of them carrying ";" or "~~"
         # reshaped the payload -- a pin name lifted from a datasheet
         # table is enough to do it by accident.
-        pins_payload, _ = _pins_payload(geom.pins)
-        pins_res = await bridge.send_command_async(
-            "library.add_pins", {"pins": pins_payload})
-
-        # Body: Altium standard light-yellow fill (discipline rule 17).
+        # BODY FIRST, THEN PINS, AND THE ORDER IS NOT COSMETIC.
+        # Altium exposes no z-order on schematic primitives: drawing order
+        # IS insertion order, and there is no send-to-back to undo it. This
+        # rectangle is solid (fill_color sets IsSolid), so adding it after
+        # the pins paints it straight over the pin names, and the only
+        # remedy is rebuilding the whole symbol. Reported from the field
+        # 2026-09-21 after exactly that rebuild.
         body = geom.body
         rect_res = await bridge.send_command_async(
             "library.add_symbol_rectangle",
@@ -542,6 +605,10 @@ def register_library_tools(mcp):
                 "border_color": 0,
             },
         )
+
+        pins_payload, _ = _pins_payload(geom.pins)
+        pins_res = await bridge.send_command_async(
+            "library.add_pins", {"pins": pins_payload})
 
         return {
             "symbol": name,
@@ -769,6 +836,13 @@ def register_library_tools(mcp):
         border_color: int = 0,
     ) -> dict[str, Any]:
         """Add a rectangle to the current symbol body.
+
+        ADD THE BODY BEFORE THE PINS. Altium exposes no z-order on
+        schematic primitives, so drawing order is insertion order and
+        there is no send-to-back to correct it afterwards. A rectangle
+        given a `fill_color` is SOLID, and one added after the pins paints
+        over the pin names; the only fix is rebuilding the symbol. Build
+        order is body, then pins, then anything drawn on top.
 
         Args:
             x1: First corner X in mils
@@ -1328,7 +1402,15 @@ def register_library_tools(mcp):
 
         Args:
             text: The string to place. Required.
-            x, y: Coordinates in mils, relative to the board origin.
+            x, y: Coordinates in mils, relative to the FOOTPRINT's origin,
+                which is what the handler has always actually done
+                (``Footprint.X + MilsToCoord(x)``). The old wording said
+                "board origin" and that was wrong: a PcbLib footprint sits
+                at Altium's library origin, 50000 mils out, so the two
+                readings differ by more than a metre. The pad, track and
+                arc tools wrote absolute board coordinates and produced
+                footprints whose geometry was nowhere near them; they now
+                match this one.
             size: Text height in mils. 50 is a common silkscreen size;
                 drop to 30-40 for tight footprints.
             width: Stroke width in mils. 8 reads cleanly at 50 mil
@@ -1768,11 +1850,12 @@ def register_library_tools(mcp):
     # =========================================================================
 
     @mcp.tool()
-    async def lib_update_footprint_heights_from_3d() -> dict[str, Any]:
+    async def lib_update_footprint_heights_from_3d(
+        mode: str = "raise",
+    ) -> dict[str, Any]:
         """Sweep the active PCB Library: for every footprint, find the
-        tallest 3D body and propagate its ``OverallHeight`` up to
-        ``Footprint.Height`` when the model is taller than the
-        currently-stored value.
+        tallest 3D body and write its ``OverallHeight`` to
+        ``Footprint.Height``.
 
         Footprint.Height is what Altium's placement-collision DRC
         uses to enforce height-clearance rules (don't place a tall
@@ -1782,26 +1865,97 @@ def register_library_tools(mcp):
         to 0 which makes the DRC silently no-op -- a real production
         risk caught only at first-article assembly.
 
+        Args:
+            mode: ``raise`` (default) only ever increases a height, so a
+                hand-set "I know this part is 5mm despite the model
+                being 3mm" survives. ``match`` also LOWERS one to the
+                model.
+
+        Reach for ``match`` when heights are too TALL, which raising
+        cannot fix and which is the more damaging fault: a footprint
+        claiming 50mm when the part is 3mm fails placement-collision
+        DRC against everything near it and blocks placements that are
+        fine, where a too-low height merely fails to catch a real
+        collision. To correct one footprint, or one with no model at
+        all, use ``lib_set_footprint_height``.
+
         Safety:
-          - Only updates footprints whose 3D model is TALLER than
-            the current Height -- never shrinks. Protects a manual
-            "I know this part is 5mm despite the model being 3mm"
-            override.
-          - Does NOT save the library; the agent should review the
-            ``items[]`` diff and save via the Altium UI or by
-            re-opening to confirm.
+          - NEITHER MODE WRITES ZERO. A footprint with no 3D body
+            yields no measurement, and writing the 0 that implies would
+            silently disable the very DRC rule this arms. Those come
+            back as ``without_model`` with their names.
+          - Does NOT save the library; review the ``items[]`` diff and
+            save in Altium.
 
         Returns:
-            Dict with:
-              - ``inspected``: total footprints walked
-              - ``updated``: footprints whose Height was raised
-              - ``items``: per-footprint diff
-                ``{name, old_height_mm, new_height_mm}``
+            Dict with ``mode``, ``inspected``, ``updated``, ``lowered``,
+            ``without_model``, ``without_model_names``, and ``items``
+            (``{name, old_height_mm, new_height_mm}`` per footprint).
         """
+        mode = (mode or "raise").strip().lower()
+        if mode not in ("raise", "match"):
+            return {
+                "ok": False,
+                "reason": (
+                    f"mode must be 'raise' (only increase, the default) or "
+                    f"'match' (also lower to the model). Got {mode!r}."),
+            }
         bridge = get_bridge()
         return await bridge.send_command_async(
-            "library.update_footprint_heights_from_3d", {},
+            "library.update_footprint_heights_from_3d", {"mode": mode},
             timeout=60.0,
+        )
+
+    @mcp.tool()
+    async def lib_set_footprint_height(
+        height_mm: float,
+        footprint_name: str = "",
+    ) -> dict[str, Any]:
+        """Set one footprint's Height directly, up or down.
+
+        The sweep can only derive a height from a 3D body, which leaves
+        two cases it cannot serve: a part with no model, and a part
+        whose model is wrong. There was no setter at all before this, so
+        a footprint carrying an absurd height could be read and not
+        corrected.
+
+        WHY TOO TALL IS WORSE THAN TOO SHORT. Footprint.Height drives
+        placement-collision DRC. A footprint claiming 50mm when the part
+        is 3mm fails against everything near it and blocks placements
+        that are fine. A too-low height only fails to catch a real
+        collision. The first floods the report and gets the rule
+        switched off; the second is quiet.
+
+        ZERO IS ACCEPTED AND IS NOT NEUTRAL. It disables the rule for
+        that footprint rather than relaxing it, so nothing is ever
+        flagged against it however tall the real part is. The reply says
+        so when zero is written.
+
+        Args:
+            height_mm: the height in MILLIMETRES, not mils. Must be
+                non-negative.
+            footprint_name: which footprint. Empty uses the library's
+                current component.
+
+        Returns:
+            ``{name, old_height_mm, new_height_mm, changed, saved,
+            save_note, note}``. ``saved`` is always false: the library
+            is modified in memory and left for you to review and save.
+        """
+        try:
+            height = float(height_mm)
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "reason": f"height_mm must be a number, got {height_mm!r}"}
+        if height < 0 or height != height:      # NaN fails both comparisons
+            return {"ok": False,
+                    "reason": (f"height_mm must be a non-negative number of "
+                               f"millimetres, got {height_mm!r}")}
+
+        bridge = get_bridge()
+        return await bridge.send_command_async(
+            "library.set_footprint_height",
+            {"height_mm": height, "footprint_name": footprint_name},
         )
 
     @mcp.tool()
@@ -1879,21 +2033,31 @@ def register_library_tools(mcp):
                 This is the common adjustment: lifting a connector body
                 off the board so it sits on its pads rather than through
                 them.
-            rotation_x: NOT APPLIED. IPCB_ComponentBody exposes a PLANAR
-                Rotation only; the PCB API gives the model no X tilt, so
-                this is accepted for signature stability and ignored.
+            rotation_x: NOT APPLIED, accepted for signature stability.
                 Set it in the library editor after linking.
             rotation_y: NOT APPLIED, same reason as rotation_x.
-            rotation_z: Z rotation in degrees, sets the body's Rotation.
+            rotation_z: NOT APPLIED. This one used to assign
+                ``Body.Rotation``, and IPCB_ComponentBody has no such
+                property on AD26 26.9.1.9. MEASURED: it raised
+                "Undeclared identifier: Rotation", which DelphiScript
+                cannot catch, so the Try around it never fired and the
+                resulting modal took the whole polling loop down with
+                it. Passing a rotation used to cost you the bridge.
+                The rotation lives on the MODEL, not the body, and has
+                to be set before the model is attached
+                (``Model.SetState`` in AutoSTEPplacer.pas). Its four
+                arguments are undocumented, so they are not guessed at
+                here. Rotate in the library editor for now.
 
         Returns:
             Dict with ``success``, ``footprint``, ``model``, and
             ``applied`` -- which adjustments were actually written to
             the body (``standoff_height``, ``rotation_z``,
-            ``offset_xy``). Check it rather than assuming: these three
-            properties are documented but are exercised nowhere else in
-            this codebase, and each assignment is individually guarded,
-            so one failing does not fail the call.
+            ``offset_xy``). Check it rather than assuming: each
+            assignment is individually guarded, so one failing does not
+            fail the call. ``rotation_z`` is now ALWAYS false, see
+            above. ``standoff_height`` is confirmed live;
+            ``offset_xy`` is not yet.
 
             A ``false`` means the adjustment did not happen, which
             covers both a rejected assignment and an argument left at
@@ -2027,6 +2191,15 @@ def register_library_tools(mcp):
                 designator string (slow on large libraries; smaller
                 payload than with_parameters). Default False.
 
+        ``part_count`` HERE IS NOT TRUSTWORTHY. It comes from the
+        CompInfoReader, and MEASURED on AD26 it reported 2 for a symbol
+        created single-part whose every pin carries OwnerPartId 1, while
+        ``lib_get_component_details`` reported 1 for an identically
+        created symbol. The two readers disagree and only the
+        discrepancy is established, not a conversion between them, so
+        no correction is applied here rather than guess one. Use
+        ``lib_get_component_details`` when the part count matters.
+
         Returns:
             Dictionary with ``count`` and ``components`` list. Each
             component carries index, name, alias_name, part_count,
@@ -2070,6 +2243,14 @@ def register_library_tools(mcp):
         ``CreateLibCompInfoReader`` so the search is fast even with
         many libraries open: it only loads symbols when ``search_type``
         is ``"parameters"``.
+
+        IT READS THE FILE ON DISK, NOT THE EDITOR. A component created
+        in this session and not yet saved WILL NOT BE FOUND, and the
+        reply is an ordinary empty result with nothing to say why.
+        MEASURED: a symbol that ``lib_get_component_details`` returned
+        in full was absent here until a save. Save first, or use
+        ``lib_get_component_details`` / ``lib_get_pin_list``, which read
+        the live document.
 
         DATASHEET DISCIPLINE: Matches carry `_datasheet_guidance`.
         Before recommending any matched part as a replacement or
@@ -2642,7 +2823,13 @@ def register_library_tools(mcp):
         config.ensure_workspace()
         batch_path = config.workspace_dir / "batch_params.txt"
 
-        with open(batch_path, "w", encoding=encoding) as f:
+        # Windows would translate the newline into CR LF here. The
+        # Pascal reader splits on the newline and leaves the carriage
+        # return attached to the LAST field on the line, so a rename
+        # wrote a LibReference ending in CR and a parameter got a CR
+        # in its value. The Pascal side trims as well; both, because
+        # either alone leaves the other half of the contract unstated.
+        with open(batch_path, "w", encoding=encoding, newline="") as f:
             for a in assignments:
                 f.write(f"{a['component_name']}|{a['param_name']}|{a['param_value']}\n")
 
@@ -2707,7 +2894,13 @@ def register_library_tools(mcp):
         config.ensure_workspace()
         batch_path = config.workspace_dir / "batch_rename.txt"
 
-        with open(batch_path, "w", encoding=encoding) as f:
+        # Windows would translate the newline into CR LF here. The
+        # Pascal reader splits on the newline and leaves the carriage
+        # return attached to the LAST field on the line, so a rename
+        # wrote a LibReference ending in CR and a parameter got a CR
+        # in its value. The Pascal side trims as well; both, because
+        # either alone leaves the other half of the contract unstated.
+        with open(batch_path, "w", encoding=encoding, newline="") as f:
             for a in assignments:
                 f.write(f"{a['old_name']}|{a['new_name']}\n")
 
@@ -2845,7 +3038,11 @@ def register_library_tools(mcp):
         return result
 
     @mcp.tool()
-    async def lib_get_pin_list(component_name: str = "") -> dict[str, Any]:
+    async def lib_get_pin_list(
+        component_name: str = "",
+        output_path: str = "",
+        inline_limit: int = 150,
+    ) -> dict[str, Any]:
         """Get all pins of a library component.
 
         NAME THE COMPONENT. Without ``component_name`` this reads
@@ -2863,15 +3060,33 @@ def register_library_tools(mcp):
         table. The response carries `_datasheet_guidance` +
         `_datasheet_parts`.
 
+        BIG SYMBOLS SPILL TO A FILE ON PURPOSE. A 699-pin module returns
+        more than a conversation can hold, and which half survives is
+        then decided by whichever client happens to be reading. Above
+        `inline_limit` pins the full array is written as JSON and the
+        reply carries `pins_path` and a summary instead. That is the
+        better artefact anyway: the file can be diffed against the
+        datasheet's pin table by script, field by field, without any of
+        it passing through the conversation.
+
         Args:
             component_name: library reference of the symbol to read.
                 Empty falls back to the editor's current component.
+            output_path: write the full pin array here as JSON and
+                return the summary. Forces the file path regardless of
+                size.
+            inline_limit: pin count above which the array is written to
+                a file instead of returned inline. 0 always returns
+                inline, which is what you want only for a small symbol.
 
         Returns:
             Dictionary with "count", "component" name, and "pins" array.
             Each pin has: designator, name, electrical_type, x, y,
             orientation, hidden. Plus `_datasheet_guidance` +
             `_datasheet_parts`.
+
+            When spilled: "pins_path" plus "summary" giving pins per
+            part and the electrical-type distribution, and no "pins".
         """
         bridge = get_bridge()
         params: dict[str, Any] = {}
@@ -2882,6 +3097,11 @@ def register_library_tools(mcp):
         )
         if isinstance(result, dict):
             comp = str(result.get("component") or "").strip()
+            pins = result.get("pins")
+            if isinstance(pins, list) and (
+                output_path or (inline_limit and len(pins) > inline_limit)
+            ):
+                result = _spill_pin_list(result, pins, comp, output_path)
             explicit = (
                 [{"manufacturer": "", "part_number": comp, "designators": ""}]
                 if comp
@@ -2891,6 +3111,45 @@ def register_library_tools(mcp):
                 result, explicit_parts=explicit, context="lib_get_pin_list"
             )
         return result
+
+    @mcp.tool()
+    async def lib_set_pin_owner_part(
+        pin_designators: str,
+        owner_part_id: int,
+        component_name: str = "",
+    ) -> dict[str, Any]:
+        """Reassign pins of a multi-part symbol to a sub-part, or to Part Zero.
+
+        ``owner_part_id=0`` is Altium's Part Zero: the pin belongs to
+        the package as a whole instead of to one sub-part. That is the
+        documented placement for a multi-part component's supply pins.
+        A sub-part-owned supply pin is redrawn at every instance origin,
+        and where the gate pitch is only twice the pin length those
+        copies land on each other and the netlist merges the two rails.
+
+        Changes the library only. Placed instances pick it up on the
+        next Update From Libraries, which produces an ECO.
+
+        Args:
+            pin_designators: comma-separated pin numbers, e.g. "3,12".
+            owner_part_id: 0 for Part Zero, or 1..part_count.
+            component_name: library reference of the symbol to edit.
+                Empty falls back to the editor's current component.
+
+        Returns:
+            Dictionary with "component", "owner_part_id", the
+            "pins_changed" list and its "count".
+        """
+        bridge = get_bridge()
+        params: dict[str, Any] = {
+            "pin_designators": pin_designators,
+            "owner_part_id": int(owner_part_id),
+        }
+        if str(component_name).strip():
+            params["component_name"] = str(component_name).strip()
+        return await bridge.send_command_async(
+            "library.set_pin_owner_part", params
+        )
 
     @mcp.tool()
     async def lib_export_kicad_symbol(
@@ -3426,6 +3685,49 @@ def register_library_tools(mcp):
         return await bridge.send_command_async("library.split_pin_functions", {})
 
     @mcp.tool()
+    async def lib_get_installed_libraries(
+        with_counts: bool = True,
+    ) -> dict[str, Any]:
+        """List the libraries installed in the Altium environment.
+
+        The answer to "what libraries does this installation have?", which
+        no other tool gives: `lib_search` walks only the SchLibs already
+        open in the workspace, and `design_snapshot_inventory` has to be
+        handed explicit .SchLib paths. This reads the environment's own
+        list, so it covers .IntLib, .SchLib, .PcbLib, database and query
+        libraries whether or not anything is open.
+
+        INSTALLED IS NOT AVAILABLE. Installed libraries are the ones
+        switched on for this environment; available ones are every library
+        it knows about. This returns the installed list and reports the
+        available total beside it, so a library that is present but not
+        switched on shows up as a gap between the two numbers rather than
+        as an absence.
+
+        Args:
+            with_counts: True (default) also reports how many components
+                each library holds. That opens every library to count
+                them, so pass False for a fast listing; the count then
+                comes back as -1, meaning not asked rather than empty.
+
+        Returns:
+            {"libraries": [{"library_path", "file_name", "library_type",
+            "library_type_ordinal", "component_count"}], "installed_count",
+            "available_count", "counts_included"}. ``library_type`` is one
+            of integrated / source / datafile / database / none / query /
+            design_items, or unknown; it reads "unknown" with an ordinal of
+            -1 when a library is installed but missing from the available
+            list, which is a real state and not an error.
+        """
+        bridge = get_bridge()
+        params: dict[str, Any] = {}
+        if not with_counts:
+            params["with_counts"] = "false"
+        return await bridge.send_command_async(
+            "library.get_installed_libraries", params
+        )
+
+    @mcp.tool()
     async def lib_install_library(library_path: str) -> dict[str, Any]:
         """Register a library with the environment's Available Libraries.
 
@@ -3625,9 +3927,14 @@ def register_library_tools(mcp):
     ) -> dict[str, Any]:
         """Delete one footprint from a PCB library (.PcbLib).
 
-        Finds the footprint by name, removes and deregisters it, then saves
-        the .PcbLib. Deletes a single named footprint; if the name is not
-        found the call errors (FOOTPRINT_NOT_FOUND). No wildcard mass-delete.
+        Finds the footprint by name, removes and deregisters it, and MARKS
+        the .PcbLib dirty. It does NOT write to disk: this bridge defers
+        saves, and `app_save_all` (or `proj_save` on the LibPkg) is what
+        flushes them. Reported: this said it saved, the footprint was still
+        in the file and the timestamp unchanged until an explicit save.
+
+        Deletes a single named footprint; if the name is not found the call
+        errors (FOOTPRINT_NOT_FOUND). No wildcard mass-delete.
 
         Args:
             footprint_name: the footprint's name in the library.
@@ -3769,7 +4076,10 @@ def register_library_tools(mcp):
 
         Renames the footprint whose name is footprint_name to new_name.
         Errors if footprint_name is not found or new_name already exists in
-        the library. Saves the .PcbLib.
+        the library.
+
+        MARKS the .PcbLib dirty; it does not write. Call `app_save_all` to
+        flush, and check what it reports actually reached disk.
 
         Args:
             footprint_name: the current footprint name.

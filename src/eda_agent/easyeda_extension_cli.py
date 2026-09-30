@@ -58,7 +58,7 @@ def _copy_extension_source(dest: Path, *, force: bool) -> Path:
     # deliberately absent from the wheel and are created in this writable
     # destination by the canonical extension build script.
     for item in source.iterdir():
-        if item.is_file():
+        if item.is_file() and item.suffix.lower() != ".eext":
             shutil.copy2(item, dest / item.name)
     return dest
 

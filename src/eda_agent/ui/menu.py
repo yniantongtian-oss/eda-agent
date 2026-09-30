@@ -33,6 +33,18 @@ time a menu changed.
 
 BECAUSE IT STEALS FOCUS, IT IS NOT A DEFAULT ANYWHERE. A caller asks for
 it explicitly, and should not while the user is typing.
+
+EVERY EVENT HERE IS GUARDED. A click or keystroke is delivered to
+whatever is active when it fires, so windows.require_foreground runs
+immediately before each one and coordinates are confined to Altium's own
+windows. Turn the whole thing off with EDA_AGENT_UI_AUTOMATION=0. The
+risks and the reasons are in docs/ui-automation.md.
+
+ONE THING IT CANNOT DO SAFELY. Altium's bar carries entries that are
+COMMANDS rather than menus, and nothing tells them apart: measured
+across all 17, identical MSAA state including HASPOPUP, identical
+accDefaultAction, identical UIA control type. Listing such an entry
+clicks it, and clicking it runs it.
 """
 
 from __future__ import annotations
@@ -62,6 +74,7 @@ _VK_ESC = 0x1B
 _KEYUP = 2
 _SW_RESTORE = 9
 _MOUSE_DOWN, _MOUSE_UP = 0x0002, 0x0004
+_RIGHT_DOWN, _RIGHT_UP = 0x0008, 0x0010
 _FRAME_CLASS = "TDocumentForm"
 
 
@@ -147,33 +160,85 @@ def _visible_rect(node):
     return rect
 
 
-def _tap(vk: int) -> None:
+#: How often the menu polls for the UI to catch up. It replaced fixed
+#: sleeps of 0.2 and 0.25, which were the granularity of every wait in
+#: the walk and therefore the floor on how fast a menu click could be.
+#: Each poll is an accessible-tree read, so this trades a little CPU for
+#: latency that the caller feels directly.
+_POLL = 0.05
+
+
+def _tap(pid: int, vk: int) -> None:
+    """One keystroke, ONLY while Altium owns the foreground.
+
+    Checked before the press and again before the release: a key held
+    down while focus moves releases into another application.
+    """
+    target = frame(pid)
+    hwnd = target.hwnd if target is not None else 0
+    win.require_foreground(hwnd, "a keystroke")
     _u().keybd_event(vk, 0, 0, 0)
     time.sleep(0.08)
+    win.require_foreground(hwnd, "a key release")
     _u().keybd_event(vk, 0, _KEYUP, 0)
 
 
-def _click(x: int, y: int) -> None:
-    """A real click, with the pointer returned to where the user left it."""
+def _click(pid: int, x: int, y: int, after: float = 0.3) -> None:
+    """A real click, with the pointer returned to where the user left it.
+
+    THE THREE SLEEPS HERE WERE 0.58s OF EVERY CLICK, and a menu path pays
+    one per level. Two of them are now waits on the thing they were
+    covering for:
+
+    * before the press, that the pointer has actually arrived. Windows
+      moves the cursor synchronously, so this is normally already true.
+    * after the release, that the UI has something to show for it. What
+      "something" means depends on the caller, so the caller passes it;
+      with no condition this keeps the old fixed pause.
+
+    The hold between down and up stays a real sleep. It is not waiting
+    for anything observable, it is making the press long enough for the
+    target to register as a click rather than a twitch.
+    """
+    target = frame(pid)
+    hwnd = target.hwnd if target is not None else 0
+    win.require_foreground(hwnd, "a click")
+
     user32 = _u()
     point = wintypes.POINT()
     user32.GetCursorPos(byref(point))
     origin = (point.x, point.y)
     user32.SetCursorPos(x, y)
-    time.sleep(0.2)
-    user32.mouse_event(_MOUSE_DOWN, 0, 0, 0, 0)
-    time.sleep(0.08)
-    user32.mouse_event(_MOUSE_UP, 0, 0, 0, 0)
-    time.sleep(0.3)
+
+    def _arrived() -> bool:
+        here = wintypes.POINT()
+        user32.GetCursorPos(byref(here))
+        return abs(here.x - x) <= 2 and abs(here.y - y) <= 2
+
+    win.wait_until(_arrived, 0.2)
+    # Re-checked after the pointer move: moving the cursor over another
+    # application can raise it, and the press below would then land
+    # there. The cursor is restored in the finally so a refusal here
+    # does not leave the pointer parked on the menu bar.
+    try:
+        win.require_foreground(hwnd, "a mouse press")
+        user32.mouse_event(_MOUSE_DOWN, 0, 0, 0, 0)
+        time.sleep(0.08)
+        user32.mouse_event(_MOUSE_UP, 0, 0, 0, 0)
+    except win.ForegroundLost:
+        user32.SetCursorPos(*origin)
+        raise
+    if after > 0:
+        time.sleep(after)
     user32.SetCursorPos(*origin)
 
 
-def _click_node(node) -> bool:
+def _click_node(pid: int, node, after: float = 0.3) -> bool:
     rect = _visible_rect(node)
     if rect is None:
         return False
     x, y, width, height = rect
-    _click(x + width // 2, y + height // 2)
+    _click(pid, x + width // 2, y + height // 2, after=after)
     return True
 
 
@@ -196,8 +261,11 @@ def close_open_menu(pid: int) -> None:
     for _ in range(3):
         if not _submenus(pid):
             return
-        _tap(_VK_ESC)
-        time.sleep(0.4)
+        _tap(pid, _VK_ESC)
+        # The popup going away is the condition. Escape usually closes it
+        # in well under the 0.4s this used to spend on every attempt, and
+        # this runs before every menu click.
+        win.wait_until(lambda: not _submenus(pid), 0.4)
 
 
 def bar_items(pid: int, timeout: float = 6.0) -> dict:
@@ -215,19 +283,24 @@ def bar_items(pid: int, timeout: float = 6.0) -> dict:
     a restore, populated a moment later.
     """
     deadline = time.monotonic() + timeout
+    interval = _POLL
     while True:
         found = _bar_items_once(pid)
         if found:
             return found
         if time.monotonic() >= deadline:
             # Empty after polling is not "this editor has no menus".
-            # MEASURED: Altium lays its bars out on ACTIVATION, not on
-            # restore. Straight after a restore the bar windows exist,
-            # have sensible rectangles, and are still IsWindowVisible
-            # false, and Altium had even recreated them under new
-            # handles. Reading returns nothing until the frame is
-            # activated, which steals focus and is therefore not
-            # something a read may do on its own.
+            # MEASURED, straight after a restore: the bar windows exist
+            # with sensible rectangles and are still IsWindowVisible
+            # false, and Altium had recreated some of them under new
+            # handles. Activating fixed it.
+            #
+            # NOT always, though, and the refusal below is worded for
+            # what was actually seen rather than as a rule. A frame that
+            # has been activated once reads its bars fine after a later
+            # restore with the focus left elsewhere, so activation is
+            # not a precondition of reading in general. It is the fix
+            # for THIS case, where the read already came back empty.
             target = frame(pid)
             if target is not None and _u().GetForegroundWindow() != target.hwnd:
                 raise MenuBarUnavailable(
@@ -243,7 +316,9 @@ def bar_items(pid: int, timeout: float = 6.0) -> dict:
                 "active window. Its bars exist but report no visible "
                 "items, which usually clears after the editor finishes "
                 "rebuilding them")
-        time.sleep(0.25)
+        time.sleep(interval)
+        if interval < 0.25:
+            interval = min(0.25, interval * 2)
 
 
 def _bar_items_once(pid: int) -> dict:
@@ -303,6 +378,7 @@ def _open_items(pid: int, timeout: float = 6.0) -> list:
     is faster than a sleep long enough to be safe.
     """
     deadline = time.monotonic() + timeout
+    interval = _POLL
     while True:
         out = []
         for popup in _submenus(pid):
@@ -312,7 +388,13 @@ def _open_items(pid: int, timeout: float = 6.0) -> list:
                 pass
         if out or time.monotonic() >= deadline:
             return out
-        time.sleep(0.2)
+        # Same backoff as win.wait_until, and for the same reason: each
+        # turn of this loop enumerates windows and walks an accessible
+        # tree, so a flat fast poll is only affordable while the answer
+        # is likely to arrive imminently.
+        time.sleep(interval)
+        if interval < 0.25:
+            interval = min(0.25, interval * 2)
 
 
 def click_path(pid: int, path: str, settle: float = 1.2) -> dict:
@@ -360,15 +442,29 @@ def click_path(pid: int, path: str, settle: float = 1.2) -> dict:
 
 
 def bring_to_front(pid: int) -> bool:
-    """Activate Altium so its menu bar gets laid out.
+    """Restore and activate Altium so its menu bar can be used.
 
-    Altium builds its DevExpress bars on ACTIVATION, not on restore, so
-    reading the bar without this raises MenuBarUnavailable no matter how
-    long you wait. Split out of _click_path because listing the menus
-    needs exactly the same preparation as clicking one: the discovery
-    call used to skip it and so could only succeed when Altium already
-    happened to be foreground, which is the one case where you do not
-    need to ask what the menus are.
+    A MINIMIZED FRAME HAS NO BARS AT ALL: measured, 35 bar windows
+    before minimizing and 0 while minimized. Restoring brings them
+    back, and a click additionally needs the activation, because
+    Windows delivers a synthesised click to whatever is foreground
+    rather than to the window it was aimed at.
+
+    Restoring alone is enough to READ, on a frame that has been
+    activated at least once. Measured with another application
+    deliberately left in front: shown with SW_SHOWNOACTIVATE, the bar
+    returned all 17 menus with Altium still in the background, and the
+    same 35 windows and 14 visible ones as before. Some of them come
+    back under NEW HANDLES, so nothing here may cache a bar handle
+    across a minimize.
+
+    The never-activated frame is a different case and is NOT covered by
+    that measurement: see _bar_items, which raises rather than reporting
+    an editor with no menus.
+
+    Both steps are done here regardless. Splitting them would offer a
+    read-only variant whose only gain is not stealing focus, and every
+    caller of this either clicks now or is about to.
 
     Returns False when there is no main window to activate.
     """
@@ -381,17 +477,24 @@ def bring_to_front(pid: int) -> bool:
         # A minimized frame parks every child at -32000, where nothing
         # can be located or clicked. Left restored afterwards: putting
         # it back would race whatever dialog the command opens.
+        #
+        # Waited for rather than slept through. The restore animation is
+        # what the old 1.2s was covering, and IsIconic going false is the
+        # thing that actually matters.
         user32.ShowWindow(target.hwnd, _SW_RESTORE)
-        time.sleep(1.2)
+        win.wait_until(lambda: not user32.IsIconic(target.hwnd), 1.2)
 
     close_open_menu(pid)
     user32.SetForegroundWindow(target.hwnd)
-    time.sleep(0.8)
+    # THE COMMON CASE IS THAT ALTIUM IS ALREADY IN FRONT, and this used
+    # to cost 0.8s regardless. The same 0.8s is still allowed for the
+    # case where it is not.
+    win.wait_until(lambda: user32.GetForegroundWindow() == target.hwnd, 0.8)
     return True
 
 
-def _click_path(pid: int, path: str, settle: float) -> dict:
-    levels = [p.strip() for p in str(path or "").split("|") if p.strip()]
+def _click_path(pid: int, path, settle: float) -> dict:
+    levels = _levels(path)
     if not levels:
         return {"ok": False, "reason": "menu_path is empty"}
 
@@ -403,6 +506,7 @@ def _click_path(pid: int, path: str, settle: float) -> dict:
         top = bar_items(pid)
     except MenuBarUnavailable as exc:
         return {"ok": False, "reason": str(exc)}
+    levels = _resolve_top(top, levels, path)
     match = next((node for caption, node in top.items()
                   if _same(caption, levels[0])), None)
     if match is None:
@@ -411,10 +515,13 @@ def _click_path(pid: int, path: str, settle: float) -> dict:
                            f"bar is per editor, so the matching document "
                            f"kind has to be focused first"),
                 "offered": sorted(top)}
-    if not _click_node(match):
+    # after=0 and no settle: _open_items below polls for up to six
+    # seconds, so a fixed pause here only postpones its first look. The
+    # patience is unchanged, the waiting is not paid when the menu is
+    # already up.
+    if not _click_node(pid, match, after=0.0):
         return {"ok": False,
                 "reason": f"{levels[0]!r} has no clickable rectangle"}
-    time.sleep(settle)
 
     for depth, wanted in enumerate(levels[1:], start=1):
         entries = _open_items(pid)
@@ -433,11 +540,15 @@ def _click_path(pid: int, path: str, settle: float) -> dict:
             return {"ok": False,
                     "reason": f"{wanted!r} is not in {levels[depth - 1]!r}",
                     "offered": [o for o in offered if o]}
-        if not _click_node(hit):
+        if not _click_node(pid, hit, after=0.0):
             close_open_menu(pid)
             return {"ok": False,
                     "reason": f"{wanted!r} has no clickable rectangle"}
-        time.sleep(settle)
+        # Either the next level opens, or on the final level the menu
+        # closes because the command ran. Both are observable, and both
+        # beat pausing for settle regardless of which happened.
+        win.wait_until(lambda: not _submenus(pid) or bool(_open_items(pid, 0.0)),
+                       settle)
 
     return {"ok": True, "path": "|".join(levels)}
 
@@ -488,8 +599,44 @@ def list_path(pid: int, path: str = "", settle: float = 1.2) -> dict:
                 pass
 
 
-def _list_path(pid: int, path: str, settle: float) -> dict:
-    levels = [p.strip() for p in str(path or "").split("|") if p.strip()]
+def _levels(path) -> list:
+    """Path levels. Accepts a LIST so a caption may contain the separator.
+
+    Altium has a bar item spelled 'Symbols | Footprints | 3D Models'.
+    Split on '|' that became three levels, none of which exists, so the
+    item was unaddressable by name and the error blamed the user for a
+    menu called 'Symbols'. A list states the levels outright and is the
+    only unambiguous form when a caption contains a pipe.
+
+    Strings still split, because every other caller passes one and
+    'Tools|Annotation' has to keep working. _resolve_top recovers the
+    string case where it can.
+    """
+    if isinstance(path, (list, tuple)):
+        return [str(p).strip() for p in path if str(p).strip()]
+    return [p.strip() for p in str(path or "").split("|") if p.strip()]
+
+
+def _resolve_top(top: dict, levels: list, raw) -> list:
+    """Levels, with a split-up bar caption put back together.
+
+    Only rewrites when the split FAILED and the whole unsplit string is
+    a real bar item, so an ordinary 'Tools|Annotation' is never touched.
+    A pipe inside a DEEPER caption cannot be recovered this way and
+    needs the list form.
+    """
+    if not levels or isinstance(raw, (list, tuple)):
+        return levels
+    if any(_same(caption, levels[0]) for caption in top):
+        return levels
+    whole = str(raw or "").strip()
+    if whole and any(_same(caption, whole) for caption in top):
+        return [whole]
+    return levels
+
+
+def _list_path(pid: int, path, settle: float) -> dict:
+    levels = _levels(path)
 
     if not bring_to_front(pid):
         return {"ok": False, "reason": "no Altium main window"}
@@ -504,6 +651,7 @@ def _list_path(pid: int, path: str, settle: float) -> dict:
             "the menu bar is per editor: focus a schematic or a board "
             "to see that editor's menus")}
 
+    levels = _resolve_top(top, levels, path)
     match = next((node for caption, node in top.items()
                   if _same(caption, levels[0])), None)
     if match is None:
@@ -512,18 +660,20 @@ def _list_path(pid: int, path: str, settle: float) -> dict:
                 "offered": sorted(top)}
 
     try:
-        # Opening a submenu leaves the PARENT popup on screen too, and
-        # the accessible layer reports every open popup together. So
-        # each level is clicked with the current popup handles recorded
-        # first, and only the popup that appeared is read back. Reading
-        # them merged returned Tools' own entries alongside
-        # Annotation's, which reads as one flat menu that does not exist.
         before = {w.hwnd for w in _submenus(pid)}
-        if not _click_node(match):
+        if not _click_node(pid, match, after=0.0):
             return {"ok": False,
                     "reason": f"{levels[0]!r} has no clickable rectangle"}
-        time.sleep(settle)
+        win.wait_until(lambda: bool({w.hwnd for w in _submenus(pid)} - before),
+                       settle)
         opened = _newest_popup(pid, before)
+
+        # Opening a submenu leaves the PARENT popup on screen too, and
+        # the accessible layer reports every open popup together. So
+        # each level below is clicked with the current popup handles
+        # recorded first, and only the popup that appeared is read back.
+        # Reading them merged returned Tools' own entries alongside
+        # Annotation's, which reads as one flat menu that does not exist.
 
         for depth, wanted in enumerate(levels[1:], start=1):
             entries = _items_of(opened) if opened else _open_items(pid)
@@ -535,14 +685,39 @@ def _list_path(pid: int, path: str, settle: float) -> dict:
                         "offered": [n for n in (_name(e) for e in entries)
                                     if n]}
             before = {w.hwnd for w in _submenus(pid)}
-            if not _click_node(hit):
+            if not _click_node(pid, hit, after=0.0):
                 return {"ok": False,
                         "reason": f"{wanted!r} has no clickable rectangle"}
-            time.sleep(settle)
+            win.wait_until(
+                lambda: bool({w.hwnd for w in _submenus(pid)} - before), settle)
             opened = _newest_popup(pid, before) or opened
 
         entries = _items_of(opened) if opened else _open_items(pid)
         items = [n for n in (_name(e) for e in entries) if n]
+
+        # A popup can be on screen and still expose no NAMED children,
+        # in which case reading only the newest one yields nothing. The
+        # merged read across every open popup is less precise, but a
+        # slightly over-broad list beats an empty one.
+        if not items:
+            items = [n for n in (_name(e) for e in _open_items(pid)) if n]
+
+        # EMPTY IS NOT A SUCCESS. This used to return ok true with
+        # items [], so a caller asking what a menu contains was told
+        # the call worked and handed nothing, with no way to tell that
+        # apart from a genuinely empty menu. MEASURED: "File" with
+        # may_steal_focus on returned ok true and no items on three
+        # consecutive calls with a PcbLib focused.
+        if not items:
+            return {"ok": False, "path": "|".join(levels), "items": [],
+                    "reason": (
+                        f"{'|'.join(levels)!r} opened but exposed no readable "
+                        f"entries. Altium builds its menus on activation and "
+                        f"the bar is per editor, so this usually means the "
+                        f"menu belongs to a different editor context than the "
+                        f"focused document, or the popup had not rendered "
+                        f"yet. Focus the matching document and retry.")}
+
         return {"ok": True, "path": "|".join(levels), "items": items}
     finally:
         # Always put the menu away. A popup left open swallows the next
@@ -566,6 +741,7 @@ def _newest_popup(pid: int, before: set, timeout: float = 6.0):
     that the entry it clicked was a command rather than a submenu.
     """
     deadline = time.monotonic() + timeout
+    interval = _POLL
     while True:
         fresh = [w.hwnd for w in _submenus(pid) if w.hwnd not in before]
         # A popup window exists before its items do, so an empty one is
@@ -575,4 +751,198 @@ def _newest_popup(pid: int, before: set, timeout: float = 6.0):
                 return hwnd
         if time.monotonic() >= deadline:
             return fresh[0] if fresh else None
-        time.sleep(0.2)
+        time.sleep(interval)
+        if interval < 0.25:
+            interval = min(0.25, interval * 2)
+
+
+def _right_click(pid: int, x: int, y: int) -> None:
+    """A real right click, pointer returned to where the user left it.
+
+    The same shape as the left click above and for the same reason: the
+    DevExpress bars answer a real click and nothing else, and a context
+    menu is drawn by the same framework.
+    """
+    target = frame(pid)
+    hwnd = target.hwnd if target is not None else 0
+    win.require_foreground(hwnd, "a right click")
+    # A right click opens a context menu wherever it lands, so the point
+    # has to be over Altium and not merely aimed while Altium is active.
+    win.require_point_in_app(int(x), int(y), hwnd, "a right click")
+    user32 = _u()
+    point = wintypes.POINT()
+    user32.GetCursorPos(byref(point))
+    origin = (point.x, point.y)
+    user32.SetCursorPos(x, y)
+
+    def _arrived() -> bool:
+        here = wintypes.POINT()
+        user32.GetCursorPos(byref(here))
+        return abs(here.x - x) <= 2 and abs(here.y - y) <= 2
+
+    win.wait_until(_arrived, 0.2)
+    try:
+        win.require_foreground(hwnd, "a right click")
+    except win.ForegroundLost:
+        user32.SetCursorPos(*origin)
+        raise
+    user32.mouse_event(_RIGHT_DOWN, 0, 0, 0, 0)
+    time.sleep(0.08)
+    win.require_foreground(hwnd, "a right release")
+    user32.mouse_event(_RIGHT_UP, 0, 0, 0, 0)
+    user32.SetCursorPos(*origin)
+
+
+def context_menu(pid: int, x: int, y: int, settle: float = 1.2) -> dict:
+    """Right click at a point and report what the context menu offers.
+
+    CONTEXT MENUS WERE ENTIRELY UNREACHABLE, and in Altium they carry a
+    great deal that no top menu duplicates: what you can do to a
+    component, a net, a polygon, a row in a panel. Automating the menu
+    bar while ignoring these leaves most of the editor unavailable.
+
+    Nothing is invoked here. A right click opens the menu and this reads
+    it, so a caller can see what is on offer before choosing. Use
+    ``context_click`` to pick one.
+
+    The menu is CLOSED again afterwards. Leaving a popup dropped blocks
+    the next operation and looks to a user like the editor has hung.
+    """
+    if not bring_to_front(pid):
+        return {"ok": False, "reason": "no Altium main window"}
+
+    close_open_menu(pid)
+    _right_click(pid, int(x), int(y))
+    entries = _open_items(pid, timeout=settle * 2)
+    items = [n for n in (_name(e) for e in entries) if n]
+    close_open_menu(pid)
+
+    if not items:
+        return {"ok": False, "at": [int(x), int(y)], "reason": (
+            "nothing opened, or it opened and exposed no items. Not "
+            "everything in Altium has a context menu, and a right click "
+            "on empty canvas often has none")}
+    return {"ok": True, "at": [int(x), int(y)], "count": len(items),
+            "items": items}
+
+
+def context_click(pid: int, x: int, y: int, item: str,
+                  settle: float = 1.2) -> dict:
+    """Right click at a point and choose one entry by name.
+
+    Nested entries work like the menu bar: pass the path with '|' and
+    each level is matched by name against what is on screen. Pass a LIST
+    instead when an entry's own caption contains a pipe.
+    """
+    levels = _levels(item)
+    if not levels:
+        return {"ok": False, "reason": "no item named"}
+    if not bring_to_front(pid):
+        return {"ok": False, "reason": "no Altium main window"}
+
+    close_open_menu(pid)
+    _right_click(pid, int(x), int(y))
+
+    for depth, wanted in enumerate(levels):
+        entries = _open_items(pid, timeout=settle * 2)
+        if not entries:
+            close_open_menu(pid)
+            return {"ok": False, "reason": (
+                "no context menu opened at that point"), "offered": []}
+        hit = next((e for e in entries if _same(_name(e), wanted)), None)
+        if hit is None:
+            offered = [n for n in (_name(e) for e in entries) if n]
+            close_open_menu(pid)
+            return {"ok": False,
+                    "reason": (f"{wanted!r} is not in the context menu"
+                               if depth == 0 else
+                               f"{wanted!r} is not in {levels[depth - 1]!r}"),
+                    "offered": offered}
+        if not _click_node(pid, hit, after=0.0):
+            close_open_menu(pid)
+            return {"ok": False,
+                    "reason": f"{wanted!r} has no clickable rectangle"}
+        win.wait_until(
+            lambda: not _submenus(pid) or bool(_open_items(pid, 0.0)), settle)
+
+    return {"ok": True, "at": [int(x), int(y)], "item": "|".join(levels)}
+
+
+def toolbars(pid: int) -> dict:
+    """Toolbar buttons on the main frame, by name.
+
+    MEASURED AT 23.9 SECONDS before this was rewritten. The first
+    version walked the accessible tree to depth four, one COM round trip
+    per node, across a frame with 126 direct children and far more below
+    them. It returned four buttons for twenty four seconds of work,
+    which is worse than not having it.
+
+    Window enumeration answers the same question in half a second: the
+    frame's children are already captured, and a toolbar button is
+    identifiable by class. The accessible tree is only consulted for the
+    handful that carry no window text.
+    """
+    frame_win = frame(pid)
+    if frame_win is None:
+        return {"ok": False, "reason": "no Altium main window"}
+
+    captured = win.capture(frame_win.hwnd)
+    if captured is None:
+        return {"ok": False, "reason": "could not read the main window"}
+
+    #: Measured on AD26: the toolbars themselves are TClientBarControl
+    #: and their buttons are TXPButtonEx / TPopupPanelButton. Anything
+    #: parked off screen is a hidden bar rather than a usable one.
+    bars, buttons = [], []
+    for control in captured.controls:
+        name = control.class_name.lower()
+        x, y, width, height = control.rect
+        if x < -10000 or not control.text:
+            continue
+        if "clientbarcontrol" in name:
+            bars.append({"name": control.text, "rect": [x, y, width, height]})
+        elif "buttonex" in name or "guidocbarbutton" in name:
+            buttons.append({"name": control.text, "hwnd": control.hwnd,
+                            "rect": [x, y, width, height]})
+
+    seen, unique = set(), []
+    for item in buttons:
+        if item["name"] in seen:
+            continue
+        seen.add(item["name"])
+        unique.append(item)
+
+    return {"ok": True, "count": len(unique), "buttons": unique,
+            "bars": bars,
+            "note": ("bars are the toolbars themselves; buttons are the "
+                     "ones exposing a caption. A button with only an icon "
+                     "has no text to match and is reachable by its "
+                     "rectangle")}
+
+
+def click_toolbar(pid: int, name: str, settle: float = 0.8) -> dict:
+    """Press a toolbar button by name."""
+    frame_win = frame(pid)
+    if frame_win is None:
+        return {"ok": False, "reason": "no Altium main window"}
+    if not bring_to_front(pid):
+        return {"ok": False, "reason": "could not focus Altium"}
+
+    listing = toolbars(pid)
+    if not listing.get("ok"):
+        return listing
+
+    def flat(text):
+        return str(text or "").replace("&", "").strip().lower()
+
+    hit = next((b for b in listing["buttons"]
+                if flat(b["name"]) == flat(name)), None)
+    if hit is None:
+        return {"ok": False, "reason": f"no toolbar button named {name!r}",
+                "offered": [b["name"] for b in listing["buttons"]][:80]}
+
+    left, top, width, height = hit["rect"]
+    _click(pid, left + width // 2, top + height // 2, after=0.0)
+    win.wait_until(lambda: bool(_submenus(pid)), settle)
+    return {"ok": True, "button": hit["name"],
+            "opened_menu": bool(_submenus(pid))}

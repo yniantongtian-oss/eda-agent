@@ -3,13 +3,99 @@
 """Altium process detection and management."""
 
 import logging
+import subprocess
 import sys
 import time
+from pathlib import Path
 import psutil
 from typing import Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger("eda_agent.bridge.process")
+
+
+# ---------------------------------------------------------------------------
+# Seeing the Windows process table from WSL.
+#
+# Under WSL the server runs in its own PID namespace. The Toolhelp scan below
+# is Windows-only and answers None here, and psutil enumerates the LINUX
+# namespace, which the Windows desktop Altium is not in and never will be. So
+# the check that gates every send_command answered "not running" about a
+# process it had no way to see, and every call was refused while the polling
+# loop was healthy and answering. Reported in GH #32 with a working diagnosis.
+#
+# tasklist.exe reports the Windows process list and is reachable over WSL
+# interop. MEASURED 2026-09-20 on Ubuntu-24.04: interop is NOT always there.
+# With systemd enabled, binfmt_misc can come up with no WSLInterop entry, and
+# then every Windows binary fails with "Exec format error" even though /mnt/c
+# holds them and WSL_INTEROP is set in the environment. So interop is a fast
+# path when present, never the thing correctness rests on, and that
+# environment variable is not a usable probe for it: only running something
+# tells you.
+# ---------------------------------------------------------------------------
+
+_WSL_TASKLIST = Path("/mnt/c/Windows/System32/tasklist.exe")
+
+# Short on purpose: this sits inside the gate that runs before commands, so a
+# wedged interop must not become the command's latency.
+_TASKLIST_TIMEOUT_S = 5.0
+
+
+def _under_wsl() -> bool:
+    """Is this a Linux kernel running under Windows?
+
+    Distinguishes "cannot see Windows processes because they are behind a
+    namespace boundary" from "cannot see them because there is no Windows
+    here". Plain Linux keeps the honest negative.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(
+            encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    return "microsoft" in release or "wsl" in release
+
+
+def _windows_tasklist_rows() -> Optional[list]:
+    """``(pid, name)`` for every Windows process, or None when there is no
+    Windows side to ask.
+
+    None is a different answer from ``[]``. None means "could not look",
+    which must never be read as "Altium is absent"; ``[]`` means the list
+    came back and held nothing.
+    """
+    if sys.platform == "win32":
+        return None
+    if not _WSL_TASKLIST.exists():
+        return None
+    try:
+        completed = subprocess.run(
+            [str(_WSL_TASKLIST), "/FO", "CSV", "/NH"],
+            capture_output=True,
+            timeout=_TASKLIST_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        # OSError covers interop-not-registered, where executing a PE binary
+        # fails outright rather than returning a non-zero code.
+        logger.debug("WSL tasklist scan unavailable: %s", e)
+        return None
+    if completed.returncode != 0:
+        return None
+    rows = []
+    # Process names are ASCII; the surrounding locale text is not worth
+    # guessing an encoding for.
+    text = completed.stdout.decode("utf-8", errors="ignore")
+    for line in text.splitlines():
+        fields = [f.strip().strip('"') for f in line.split(",")]
+        if len(fields) < 2:
+            continue
+        name, pid_text = fields[0], fields[1]
+        if not pid_text.isdigit():
+            continue
+        rows.append((int(pid_text), name))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +182,22 @@ class AltiumProcessInfo:
     cmdline: Optional[list[str]] = None
 
 
+@dataclass
+class AltiumSelection:
+    """Which Altium process to act on, and how that was decided.
+
+    ``selected_by`` is one of ``none`` (no Altium running),
+    ``only_candidate``, ``status_form``, ``only_windowed`` or
+    ``ambiguous``. When ambiguous, ``process`` is None and ``reason``
+    names the candidates.
+    """
+
+    process: Optional[AltiumProcessInfo]
+    candidates: list[AltiumProcessInfo]
+    selected_by: str
+    reason: str = ""
+
+
 class AltiumProcessManager:
     """Manages detection and interaction with Altium Designer process."""
 
@@ -110,28 +212,140 @@ class AltiumProcessManager:
     def __init__(self):
         self._running_cache: Optional[tuple[float, bool]] = None
 
-    def find_altium_process(self) -> Optional[AltiumProcessInfo]:
-        """Find a running Altium Designer process, with full info.
+    #: Caption of the bridge's status window, which StartMCPServer opens.
+    #: The process owning a window with this caption is, by construction,
+    #: the one running the script. Must match the Caption in
+    #: scripts/altium/StatusForm.dfm; a test holds the two together.
+    STATUS_FORM_TITLE = "EDA Agent MCP"
 
-        Fetches exe + cmdline, so this is the SLOW path -- only call it
-        when that detail is actually needed (status display, version
-        probe). For a plain "is it running?" check use is_altium_running.
-        """
+    def _candidates(self) -> list[AltiumProcessInfo]:
+        """Every Altium process, in enumeration order. The slow path:
+        fetches exe and cmdline for each."""
+        wanted = {n.upper() for n in self.PROCESS_NAMES}
+        out: list[AltiumProcessInfo] = []
+        # WSL with interop: enumerate the Windows side. tasklist carries no
+        # exe path or command line, so those stay empty; the selection logic
+        # falls back to the single-candidate case, and the file channel is
+        # what reaches Altium either way.
+        rows = _windows_tasklist_rows()
+        if rows is not None:
+            for pid, name in rows:
+                if name.upper() in wanted:
+                    out.append(AltiumProcessInfo(
+                        pid=pid,
+                        name=name,
+                        exe_path="",
+                        cmdline=None,
+                    ))
+            return out
         for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
             try:
                 proc_name = proc.info["name"] or ""
-                if proc_name.upper() in [n.upper() for n in self.PROCESS_NAMES]:
-                    info = AltiumProcessInfo(
+                if proc_name.upper() in wanted:
+                    out.append(AltiumProcessInfo(
                         pid=proc.info["pid"],
                         name=proc.info["name"],
                         exe_path=proc.info["exe"] or "",
                         cmdline=proc.info["cmdline"],
-                    )
-                    logger.debug("Found Altium process: PID=%d", proc.info["pid"])
-                    return info
+                    ))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-        return None
+        return out
+
+    @staticmethod
+    def _window_owner_pids(title_prefix: Optional[str] = None) -> Optional[set]:
+        """Pids owning a top-level window, or None if windows cannot be read.
+
+        With ``title_prefix``: windows whose caption starts with it,
+        hidden ones included. Without: VISIBLE windows only, which is
+        what separates a live instance from the windowless orphan a
+        crashed session leaves behind.
+        """
+        try:
+            from ..ui import windows
+        except Exception:                        # noqa: BLE001
+            return None
+        if not windows.available():
+            return None
+        try:
+            found = windows.enumerate_windows(
+                visible_only=title_prefix is None)
+        except Exception:                        # noqa: BLE001
+            return None
+        if title_prefix is None:
+            return {w.pid for w in found}
+        return {w.pid for w in found
+                if (w.title or "").startswith(title_prefix)}
+
+    def select_altium_process(self) -> AltiumSelection:
+        """Which Altium to act on, and how that was decided. Slow path.
+
+        THE FIRST MATCH IS NOT AN ANSWER. This used to return whichever
+        X2.exe the process scan yielded first. A crashed session leaves
+        a windowless orphan, and when that enumerated first every UI
+        tool read ITS windows: no dialog open, no button to press, while
+        a modal sat plainly on screen in the real instance. Bridge calls
+        kept working throughout, because they go through the file channel
+        to whichever instance runs the script, so half the toolset talked
+        to one Altium and half to the other and nothing said so.
+
+        With more than one candidate, in order:
+
+        1. the one owning the bridge's status window, which only the
+           instance running StartMCPServer has;
+        2. the only one with a visible top-level window;
+        3. otherwise none: ``ambiguous``, with every pid named. A tool
+           acting on a guess here reads the wrong process's dialogs, and
+           an empty read looks exactly like a correct one.
+
+        Windows are read only when there is more than one candidate, so
+        the ordinary single-instance case costs what it always did.
+        """
+        candidates = self._candidates()
+        if not candidates:
+            return AltiumSelection(None, [], "none")
+        if len(candidates) == 1:
+            return AltiumSelection(candidates[0], candidates, "only_candidate")
+
+        pids = [c.pid for c in candidates]
+        by_pid = {c.pid: c for c in candidates}
+
+        scripted = self._window_owner_pids(self.STATUS_FORM_TITLE)
+        scripted_hits = [p for p in pids if scripted and p in scripted]
+        if len(scripted_hits) == 1:
+            return AltiumSelection(by_pid[scripted_hits[0]], candidates,
+                                   "status_form")
+
+        windowed = self._window_owner_pids()
+        windowed_hits = [p for p in pids if windowed and p in windowed]
+        if len(windowed_hits) == 1 and not scripted_hits:
+            return AltiumSelection(by_pid[windowed_hits[0]], candidates,
+                                   "only_windowed")
+
+        if scripted is None or windowed is None:
+            why = "their windows could not be read on this host"
+        elif len(scripted_hits) > 1:
+            why = (f"{len(scripted_hits)} of them show the bridge's status "
+                   f"window")
+        else:
+            why = (f"{len(windowed_hits)} of them have visible windows and "
+                   f"none shows the bridge's status window")
+        reason = (
+            f"{len(pids)} Altium processes are running (pids "
+            f"{', '.join(str(p) for p in pids)}) and {why}, so there is no "
+            f"telling which one to act on. Refusing rather than guessing: a "
+            f"dialog read from the wrong process looks exactly like no "
+            f"dialog. Close the instance you do not mean, or start the "
+            f"bridge in the one you do, so its status window identifies it.")
+        return AltiumSelection(None, candidates, "ambiguous", reason)
+
+    def find_altium_process(self) -> Optional[AltiumProcessInfo]:
+        """The Altium process to act on, or None.
+
+        None also when several are running and none can be identified;
+        ``select_altium_process`` says which of the two it was.
+        """
+        return self.select_altium_process().process
 
     def _scan_running(self) -> bool:
         """Is any Altium process running? Native Toolhelp scan first
@@ -141,6 +355,27 @@ class AltiumProcessManager:
         native = _scan_process_names_native(wanted)
         if native is not None:
             return native
+
+        # WSL, interop working: ask the list that actually decides whether
+        # the bridge can work, which is the Windows one.
+        rows = _windows_tasklist_rows()
+        if rows is not None:
+            return any(name.upper() in wanted for _pid, name in rows)
+
+        # WSL, interop unavailable: NOTHING HERE CAN ANSWER THE QUESTION, and
+        # saying False would be a claim rather than an answer. psutil below
+        # would return False every time, which is how a healthy bridge came
+        # to be reported as "Altium is not running" for every single call.
+        # Report True and let the request itself find out: a real absence
+        # then surfaces as the IPC timeout, which names the fault and lists
+        # the steps, instead of a confident wrong diagnosis up front.
+        if _under_wsl():
+            logger.debug(
+                "under WSL with no interop: cannot enumerate Windows "
+                "processes, so proceeding and letting the IPC timeout "
+                "diagnose instead of refusing up front")
+            return True
+
         # Fallback: psutil. Slower, but correct on non-Windows / if the
         # native path failed.
         try:
@@ -172,9 +407,11 @@ class AltiumProcessManager:
         """Get information about the running Altium process.
 
         Returns:
-            AltiumProcessInfo if Altium is running, None otherwise.
+            AltiumProcessInfo for the instance to act on. None when
+            Altium is not running, and also when several are running and
+            none can be identified as the scripted one.
         """
-        return self.find_altium_process()
+        return self.select_altium_process().process
 
     def get_altium_pid(self) -> Optional[int]:
         """Get the PID of the running Altium process.

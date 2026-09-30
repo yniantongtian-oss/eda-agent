@@ -19,12 +19,12 @@ Snapshot date: 2026-08-21.
 
 The set intentionally covers different layers rather than collecting duplicate MCP servers:
 
-1. **Direct LLM-to-COMSOL control** — `COMSOL_Multiphysics_MCP`.
-2. **Stable Python automation layer** — `MPh`.
-3. **General CAE agent runtime** — `sim-cli`.
-4. **COMSOL-specific runtime bridge** — `sim-plugin-comsol`.
-5. **Machine-learning-driven topology optimization** — `deep_learning_topology_opt`.
-6. **FEM-generated data + neural surrogate modeling** — `AI-mag`.
+1. **Direct LLM-to-COMSOL control** : `COMSOL_Multiphysics_MCP`.
+2. **Stable Python automation layer** : `MPh`.
+3. **General CAE agent runtime** : `sim-cli`.
+4. **COMSOL-specific runtime bridge** : `sim-plugin-comsol`.
+5. **Machine-learning-driven topology optimization** : `deep_learning_topology_opt`.
+6. **FEM-generated data + neural surrogate modeling** : `AI-mag`.
 
 Together they are a useful reference base for extending `eda-agent` from EDA-only workflows toward a broader engineering agent that can coordinate circuit design, multiphysics simulation, optimization, and learned surrogate models.
 

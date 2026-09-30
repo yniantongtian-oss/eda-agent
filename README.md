@@ -1,6 +1,9 @@
 # eda-agent
 
-MCP server that lets an AI (or any MCP-compatible client) **interact with a live Altium Designer session**, with KiCad and EasyEDA Pro available as additional backends. It exposes around 400 tools on Altium, covering schematic, PCB, library, project, and design-agent operations, over a persistent DelphiScript bridge. The AI reads the design you currently have open, asks questions about it, and can modify it in place while you watch. The [backend](#eda-backends) is selected at startup, so each user sees only their own tool set.
+> **Fork integration note.** This fork tracks `salitronic/eda-agent` while adding verified wheel/sdist delivery, a wheel-packaged EasyEDA Pro extension helper, and a pinned COMSOL-AI ecosystem. Fork-specific delivery acceptance is documented in [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md) and the COMSOL integration inventory in [docs/comsol-ai-ecosystem.md](docs/comsol-ai-ecosystem.md).
+
+
+MCP server that lets an AI (or any MCP-compatible client) **interact with a live Altium Designer session**, with KiCad and EasyEDA Pro available as additional backends. It exposes around 450 tools for schematic, PCB, library, project, and design-agent operations over a persistent DelphiScript bridge. The AI reads the design you currently have open, asks questions about it, and can modify it in place while you watch. The [backend](#eda-backends) is selected at startup, so each user sees only their own tool set.
 
 > **⚠️ Experimental.** Not all tools are extensively tested. Some can crash the Altium DelphiScript engine. See [Known limitations](#known-limitations) before using on any design you haven't backed up.
 
@@ -31,7 +34,7 @@ This is **not** a batch tool that opens a project, runs a script, and exits. It'
 
 ## Features
 
-- **~400 tools on the default Altium backend** (480+ with both registered) across application, project, library, schematic/general, PCB, and design-agent categories
+- **~450 tools on the default Altium backend** (530+ with both registered) across application, project, library, schematic/general, PCB, and design-agent categories
 - **Generic primitives** (`obj_query`, `obj_modify`, `obj_create`, `obj_delete`, `run_process`) that work on almost any schematic or PCB object type via late-binding, avoiding per-type handler proliferation
 - **Bulk batch primitives**: `obj_batch_modify`, `obj_batch_create`, `obj_batch_delete`, `pcb_place_tracks`, `pcb_move_components`, `sch_place_wires`, `place_net_labels`, `place_power_ports`, `sch_place_components`, `sch_set_components_parameters`, `get_sch_doc_pins`, `lib_add_pins`, `proj_get_connectivity_many`, `sim_attach_primitives`. Collapse N LLM turns + N IPC round-trips into one. Typical wall-time savings: 10 to 100x on multi-item edits
 - **Design review snapshot**: `design_review_snapshot` bundles 8 to 12 review reads (project info, components, nets, rules, diff, messages, stats, unrouted, BOM) into a single call. One LLM turn instead of a dozen
@@ -76,10 +79,12 @@ This repository is a maintained fork of `salitronic/eda-agent`. Upstream authors
 ```bash
 git clone https://github.com/yniantongtian-oss/eda-agent
 cd eda-agent
-pip install -e .
+python -m pip install -e .
 ```
 
-Register the server with your MCP client. The binary is `eda-agent` and runs on stdio; consult your client's docs for how to add a local stdio-based server.
+Use `python -m pip` rather than a bare `pip`. It works even when pip's `Scripts` folder is not on your `PATH`, which is common when Python was installed for you by IT, and it guarantees the package goes into the same Python you will run it with.
+
+Register the server with your MCP client. The binary is `eda-agent` and runs on stdio; consult your client's docs for how to add a local stdio-based server. Everywhere this README says `eda-agent`, `python -m eda_agent` does exactly the same thing and does not depend on `PATH`.
 
 ### Verified CI delivery
 
@@ -104,11 +109,19 @@ Adds `eda-agent` as an MCP server named `altium` to your Claude Code project con
 claude mcp add -s user altium eda-agent
 ```
 
-If `eda-agent` isn't on your `PATH`, give the full path instead (pip reports it after install, typically `%USERPROFILE%\AppData\Roaming\Python\Python312\Scripts\eda-agent.exe` on Windows). To verify the connection: `/mcp` in a Claude Code session should list `altium` as connected.
+If `eda-agent` isn't on your `PATH` ("'eda-agent' is not recognized"), register it through Python instead. This needs no path at all:
+
+```bash
+claude mcp add -s user altium -- python -m eda_agent
+```
+
+The `--` matters: it tells `claude mcp add` that everything after it is the command to run, rather than options for `claude` itself.
+
+To verify the connection: `/mcp` in a Claude Code session should list `altium` as connected.
 
 ### Other MCP clients
 
-The server speaks standard MCP over stdio; any client that accepts a local stdio command will work. Invoke `eda-agent` (or `eda-agent serve`) as the subprocess.
+The server speaks standard MCP over stdio; any client that accepts a local stdio command will work. Invoke `eda-agent` (or `eda-agent serve`) as the subprocess, or `python -m eda_agent` if it is not on your `PATH`.
 
 ### Altium-side scripts
 
@@ -116,6 +129,12 @@ Drop the Altium script project somewhere you can find it:
 
 ```bash
 eda-agent install-scripts
+```
+
+or, if `eda-agent` is not recognised:
+
+```bash
+python -m eda_agent install-scripts
 ```
 
 Default destination: `%USERPROFILE%\EDA Agent\scripts\`. Use `--dest PATH` to put it elsewhere.
@@ -311,6 +330,30 @@ Bulk tools like `obj_batch_modify`, `pcb_move_components`, and `sch_place_compon
 
 > Bridge changes are checked by Free Pascal and a linter before they ship, which cannot prove Altium's own DelphiScript engine accepts them: the two differ on which identifiers exist, and an undeclared one faults at runtime rather than at compile time. [`docs/RELEASE_VERIFICATION.md`](docs/RELEASE_VERIFICATION.md) is the procedure for closing that gap on a release, starting with a self-test that runs inside Altium and needs no document.
 
+### UI automation synthesises real keyboard and mouse input
+
+Most of this project talks to Altium through the scripting bridge, which addresses a window handle directly and cannot affect anything else. The `app_*` UI automation tools are different, and are used where Altium offers no other route: `application.execute_menu` reports success while invoking nothing, `GetMenu` returns 0 on Altium's DevExpress bars, and whole dialogs (Update From Libraries, Preferences, the wizards) have no scripting API at all.
+
+**Synthesised input is not addressed to a window.** `keybd_event` and `mouse_event` are delivered to whatever is active at the instant they fire, and a click lands on whatever is under the pointer. So these tools:
+
+- **take focus.** Menus and clicks need Altium in front, so running them while you are typing will interrupt you
+- **cannot be confirmed the way a property write can.** A keystroke has no read-back; anything that matters is verified afterwards with a bridge read
+- could, without containment, deliver an event to another application if focus or the pointer moved
+
+What contains that: a foreground check runs **immediately before every event**, including between a key press and its release, and refocuses Altium rather than failing; coordinates are refused unless the point is over a window belonging to Altium's own process; and no tool accepts a window handle from the caller, so an arbitrary window cannot be addressed. `tests/test_foreground_guard.py` enforces all three, checking the event guard per line of source rather than per function, because a function that checks once and then emits five events in a loop would pass a naive test while firing four unchecked events.
+
+**To switch it off entirely:**
+
+```
+EDA_AGENT_UI_AUTOMATION=0
+```
+
+Every synthesised event is then refused. Reading stays available on purpose, because dialog detection is how the rest of the system notices Altium is blocked on a modal.
+
+One case is not solvable: Altium's menu bar carries entries that are commands rather than menus (Place a Comment, Share, Open Home page, Preferences), and nothing distinguishes them. Measured across all 17 bar items: identical MSAA state including `HASPOPUP`, identical `accDefaultAction`, identical UIA control type. Listing such an entry clicks it, and clicking it runs it.
+
+Full detail in [`docs/ui-automation.md`](docs/ui-automation.md).
+
 ### Altium DelphiScript engine can crash
 
 Some tool paths trigger DelphiScript compile or runtime errors ("Undeclared identifier…", "Could not convert variant of type (Dispatch) into type (OleStr)", etc.). When that happens, the script project halts mid-execution and the polling loop stops responding. You will see one of:
@@ -464,6 +507,13 @@ Workspace (used for IPC files between Python and Altium):
 - Override: set `EDA_AGENT_WORKSPACE` environment variable
 - The DelphiScript side reads the resolved path from `C:\ProgramData\eda-agent\workspace-path.txt`, which Python writes at startup and on every `install-scripts` run
 
+UI automation (synthesised keyboard and mouse input, used for the parts of Altium with no scripting API):
+
+- Default: **on**
+- Disable: set `EDA_AGENT_UI_AUTOMATION=0` (also `false`, `no`, `off`). Anything else leaves it on, so a typo cannot silently disable it
+- Read at call time, so it takes effect on the next event rather than the next restart
+- See [UI automation synthesises real keyboard and mouse input](#ui-automation-synthesises-real-keyboard-and-mouse-input) for what it is for and what it can do
+
 Coordinates throughout the API are in **mils** (1 mil = 0.0254 mm).
 
 ## Development
@@ -533,3 +583,15 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 This software is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not liable for any damage to your designs, projects, data, or installation.
 
 This project is not affiliated with, endorsed by, or sponsored by Altium Limited, the KiCad project, or EasyEDA. "Altium" and "Altium Designer" are trademarks of Altium Limited; "KiCad" and "EasyEDA" are trademarks of their respective owners. `eda-agent` is an independent community tool that interoperates with each of these applications through its own published API: Altium Designer via its scripting API, KiCad via its IPC API and command line, and EasyEDA Pro via its extension API.
+
+## Fork delivery extensions
+
+The fork CI additionally verifies the built Python distributions and the EasyEDA extension payload. After installing the fork wheel, the packaged extension can be materialized with:
+
+```bash
+eda-agent-easyeda-extension build --dest easyeda-extension
+```
+
+The resulting `.eext` can be imported into EasyEDA Pro. Release acceptance, checksums, and live-editor boundaries are documented in [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md).
+
+The repository also pins a small COMSOL/AI tool ecosystem as git submodules under `external/comsol-ai/`; see [docs/comsol-ai-ecosystem.md](docs/comsol-ai-ecosystem.md) before updating those pins.

@@ -78,19 +78,148 @@ begin
   end;
 end;
 
-function StrToFloatDefCustom(S : String; Default : Double) : Double;
-begin
-  if (S = '') or (S = 'null') then
-    Result := Default
-  else
-  begin
-    try
-      Result := StrToFloat(S);
-    except
-      Result := Default;
-    end;
-  end;
-end;
+{ --- From Utils.pas, verbatim. tests/test_locale_decimal.py fails if  }
+{ these drift. Replaced a hand-written StrToFloatDefCustom that shared }
+{ only the NAME with the real function and had none of its guards.     }
+Function IsFloatStr(S : String) : Boolean;
+Var
+    I, StartPos : Integer;
+    Dots, Digits, Exponents : Integer;
+    Ch : String;
+Begin
+    S := Trim(S);
+    Result := False;
+    If S = '' Then Exit;
+    StartPos := 1;
+    If (S[1] = '-') Or (S[1] = '+') Then StartPos := 2;
+    If StartPos > Length(S) Then Exit;
+
+    Dots := 0;
+    Digits := 0;
+    Exponents := 0;
+    For I := StartPos To Length(S) Do
+    Begin
+        Ch := Copy(S, I, 1);
+        If (Ch >= '0') And (Ch <= '9') Then
+            Digits := Digits + 1
+        Else If Ch = '.' Then
+        Begin
+            Dots := Dots + 1;
+            If Dots > 1 Then Exit;
+            If Exponents > 0 Then Exit;   { 1e5.5 is not a number }
+        End
+        Else If (Ch = 'e') Or (Ch = 'E') Then
+        Begin
+            Exponents := Exponents + 1;
+            If Exponents > 1 Then Exit;
+            If Digits = 0 Then Exit;      { 'e5' has no mantissa }
+            { A sign may follow the exponent, and a digit must. }
+            If I = Length(S) Then Exit;
+            Ch := Copy(S, I + 1, 1);
+            If (Ch = '-') Or (Ch = '+') Then
+            Begin
+                If I + 1 = Length(S) Then Exit;
+                Ch := Copy(S, I + 2, 1);
+            End;
+            If (Ch < '0') Or (Ch > '9') Then Exit;
+        End
+        Else
+            Exit;                          { anything else is not a number }
+    End;
+    Result := Digits > 0;
+End;
+
+Function FloatToJsonStr(Value : Double) : String;
+Var
+    Sep, Ch, Swapped : String;
+    I : Integer;
+Begin
+    { Locale-agnostic float -> string. Delphi FloatToStr respects the global
+      DecimalSeparator, so on a comma-decimal system it produces '90,0',
+      which is not valid JSON.
+
+      NO GLOBAL IS MUTATED. This used to set DecimalSeparator to '.' for the
+      duration of the call and restore it after. That works, but it leaves a
+      window in which a global the whole application shares has been changed
+      underneath it, and the window gets wider every time another call site
+      starts using this wrapper. Converting first and swapping the separator
+      character afterwards has no window at all.
+
+      Swapping is complete because FloatToStr emits only digits, a sign, an
+      exponent 'E' and the single decimal separator. It never emits a
+      thousands separator, which is FloatToStrF with ffNumber. }
+    Result := FloatToStr(Value);
+    Sep := DecimalSeparator;
+    If Sep <> '.' Then
+    Begin
+        Swapped := '';
+        For I := 1 To Length(Result) Do
+        Begin
+            Ch := Copy(Result, I, 1);
+            If Ch = Sep Then Ch := '.';
+            Swapped := Swapped + Ch;
+        End;
+        Result := Swapped;
+    End;
+End;
+
+Function StrToFloatDef(S : String; Default : Double) : Double;
+Var
+    Sep, Ch, Work : String;
+    I : Integer;
+Begin
+    { Locale-agnostic float parsing. JSON always uses '.' as the decimal      }
+    { separator regardless of the user's Windows regional settings, but Delphi}
+    { StrToFloat respects the global DecimalSeparator, so on a system with    }
+    { comma-as-decimal (much of Europe) parsing "90.0" silently fails and     }
+    { the default value comes back instead. The string is reshaped into the   }
+    { form THIS locale parses and the global is never touched; forcing the    }
+    { separator and restoring it was the earlier approach and is now          }
+    { forbidden by test_the_wrappers_do_not_mutate_the_global_separator.      }
+    If (S = '') Or (S = 'null') Then
+    Begin
+        Result := Default;
+        Exit;
+    End;
+    { PRE-CHECKED, not merely guarded. The Try/Except below cannot save
+      the session: the script IDE breaks on the exception before the
+      handler runs, so a value like 'abc' halts on the StrToFloat line
+      behind an EConvertError dialog and the polling loop stops with it.
+      StrToIntDef has carried this pre-check for the same reason. }
+    If Not IsFloatStr(S) Then
+    Begin
+        Result := Default;
+        Exit;
+    End;
+
+    { IsFloatStr above guarantees S is in dot form, so the conversion is
+      done by putting it into the form THIS locale parses rather than by
+      forcing the locale to match the string. Same reasoning as the emit
+      side: no global is touched, so there is no window.
+
+      The Try/Except is kept as a backstop and should now be unreachable:
+      a pre-validated, locale-formed string does not raise EConvertError.
+      It is deliberately not relied on, because the script engine surfaces
+      an RTL conversion error as a modal before the handler runs. }
+    Sep := DecimalSeparator;
+    Work := S;
+    If Sep <> '.' Then
+    Begin
+        Work := '';
+        For I := 1 To Length(S) Do
+        Begin
+            Ch := Copy(S, I, 1);
+            If Ch = '.' Then Ch := Sep;
+            Work := Work + Ch;
+        End;
+    End;
+
+    Try
+        Result := StrToFloat(Work);
+    Except
+        Result := Default;
+    End;
+End;
 
 function EscapeJsonString(S : String) : String;
 begin
@@ -741,6 +870,56 @@ end;
 { Dispatcher                                                                 }
 { ========================================================================= }
 
+{ --- From Generic.pas. Kept byte-identical to the original;   }
+{ tests/test_pin_connection_point.py fails if they diverge.    }
+Function PinEndX(RootX : Integer; Orient : Integer; PinLen : Integer) : Integer;
+Begin
+    Result := RootX;
+    If Orient = 0 Then Result := RootX + PinLen
+    Else If Orient = 2 Then Result := RootX - PinLen;
+End;
+
+Function PinEndY(RootY : Integer; Orient : Integer; PinLen : Integer) : Integer;
+Begin
+    Result := RootY;
+    If Orient = 1 Then Result := RootY + PinLen
+    Else If Orient = 3 Then Result := RootY - PinLen;
+End;
+
+{ --- From Dispatcher.pas. Kept byte-identical to the original; }
+{ tests/test_netlist_cache_staleness.py fails if they diverge.  }
+Function ActionHasPrefix(Verb : String; Prefix : String) : Boolean;
+Begin
+    Result := Copy(Verb, 1, Length(Prefix)) = Prefix;
+End;
+
+Function CommandIsReadOnly(Command : String) : Boolean;
+Var
+    Verb : String;
+    DotPos : Integer;
+Begin
+    Verb := LowerCase(Trim(Command));
+    DotPos := Pos('.', Verb);
+    If DotPos > 0 Then Verb := Copy(Verb, DotPos + 1, Length(Verb) - DotPos);
+
+    Result := ActionHasPrefix(Verb, 'get_')
+           Or ActionHasPrefix(Verb, 'list_')
+           Or ActionHasPrefix(Verb, 'query')
+           Or ActionHasPrefix(Verb, 'read_')
+           Or ActionHasPrefix(Verb, 'find_')
+           Or ActionHasPrefix(Verb, 'count')
+           Or ActionHasPrefix(Verb, 'audit_')
+           Or ActionHasPrefix(Verb, 'check_')
+           Or ActionHasPrefix(Verb, 'calc_')
+           Or ActionHasPrefix(Verb, 'export_')
+           Or ActionHasPrefix(Verb, 'render_')
+           Or ActionHasPrefix(Verb, 'probe_')
+           Or ActionHasPrefix(Verb, 'inspect_')
+           Or ActionHasPrefix(Verb, 'diff_')
+           Or ActionHasPrefix(Verb, 'compare_')
+           Or (Verb = 'ping');
+End;
+
 function B64Decode(S : String) : String;
 begin
   { Convention: '_' means empty string (avoids empty base64 fields) }
@@ -767,6 +946,7 @@ var
   IntResult : Integer;
   FloatResult : Double;
   BoolResult : Boolean;
+  SavedSep : Char;
 begin
   Parts := TStringList.Create;
   try
@@ -778,8 +958,59 @@ begin
     FnName := Parts[0];
     ResultStr := '';
 
+    { --- FloatUnderComma: emit then parse with a comma separator --- }
+    if FnName = 'FloatUnderComma' then
+    begin
+      SavedSep := DecimalSeparator;
+      DecimalSeparator := ',';
+      try
+        ResultStr := FloatToJsonStr(StrToFloat(StringReplace(
+          B64Decode(Parts[1]), '.', ',', [rfReplaceAll])));
+      finally
+        DecimalSeparator := SavedSep;
+      end;
+    end
+
+    { --- ParseUnderComma: parse a dot-form string on a comma locale --- }
+    else if FnName = 'ParseUnderComma' then
+    begin
+      SavedSep := DecimalSeparator;
+      DecimalSeparator := ',';
+      try
+        FloatResult := StrToFloatDef(B64Decode(Parts[1]), -999);
+        ResultStr := FloatToJsonStr(FloatResult);
+      finally
+        DecimalSeparator := SavedSep;
+      end;
+    end
+
+    { --- PinEndX: args = root_x, orient, pin_len --- }
+    else if FnName = 'PinEndX' then
+    begin
+      ResultStr := IntToStr(PinEndX(StrToInt(B64Decode(Parts[1])),
+                                    StrToInt(B64Decode(Parts[2])),
+                                    StrToInt(B64Decode(Parts[3]))));
+    end
+
+    { --- PinEndY: args = root_y, orient, pin_len --- }
+    else if FnName = 'PinEndY' then
+    begin
+      ResultStr := IntToStr(PinEndY(StrToInt(B64Decode(Parts[1])),
+                                    StrToInt(B64Decode(Parts[2])),
+                                    StrToInt(B64Decode(Parts[3]))));
+    end
+
+    { --- CommandIsReadOnly: args = command --- }
+    else if FnName = 'CommandIsReadOnly' then
+    begin
+      if CommandIsReadOnly(B64Decode(Parts[1])) then
+        ResultStr := 'true'
+      else
+        ResultStr := 'false';
+    end
+
     { --- ExtractJsonValue: args = json_str, key --- }
-    if FnName = 'ExtractJsonValue' then
+    else if FnName = 'ExtractJsonValue' then
     begin
       ResultStr := ExtractJsonValue(B64Decode(Parts[1]), B64Decode(Parts[2]));
     end
@@ -878,7 +1109,7 @@ begin
     { --- StrToFloatDef: args = s, default (float) --- }
     else if FnName = 'StrToFloatDef' then
     begin
-      FloatResult := StrToFloatDefCustom(B64Decode(Parts[1]), StrToFloat(B64Decode(Parts[2])));
+      FloatResult := StrToFloatDef(B64Decode(Parts[1]), StrToFloat(B64Decode(Parts[2])));
       ResultStr := FormatFloat('0.0000000000', FloatResult);
     end
 

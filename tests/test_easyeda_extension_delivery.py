@@ -39,6 +39,21 @@ def test_easyeda_extension_payload_copies_to_a_writable_build_dir(tmp_path: Path
     assert not (copied / "eda-agent-bridge.eext").exists()
 
 
+def test_easyeda_extension_copy_excludes_prebuilt_packages(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in REQUIRED:
+        (source / name).write_text("source payload", encoding="utf-8")
+    (source / "eda-agent-bridge.eext").write_bytes(b"old build")
+    (source / "previous.EEXT").write_bytes(b"another old build")
+    monkeypatch.setattr(
+        "eda_agent.easyeda_extension_cli.packaged_extension_dir", lambda: source)
+
+    copied = _copy_extension_source(tmp_path / "destination", force=False)
+
+    assert {path.name for path in copied.iterdir()} == REQUIRED
+
+
 def test_easyeda_extension_copy_refuses_to_overwrite_nonempty_dest(tmp_path: Path):
     dest = tmp_path / "extension"
     dest.mkdir()

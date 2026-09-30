@@ -91,6 +91,36 @@ const ATTACH_STALL_MS = 30000;
 //: idle counter twice per interval.
 let lastTickAt = 0;
 
+//: What the last attach actually observed, in words, for the editor.
+//:
+//: WHY THIS EXISTS IN THE EDITOR AND NOT ONLY OVER THE WIRE. Every
+//: other diagnostic here is reported in the ping reply, which is
+//: readable exactly when a connection already works, and therefore
+//: useless for the one question anybody asks: why is it not connected?
+//: The operator sits in front of the editor with no console and no way
+//: to see a scan that fails in silence.
+//:
+//: So the outcome of each scan is kept here and shown from the menu.
+let lastOutcome = 'not attempted yet';
+let lastOutcomeAt = 0;
+
+//: What each port said when asked, kept from the last health scan.
+//:
+//: The entry that matters is a port that answers /health with SOME
+//: OTHER service. Our range and path (49620-49629, /eda) are the ones
+//: EasyEDA's own bridge server uses, so a port answering `easyeda-bridge`
+//: means the official gateway is running there and the two are
+//: competing for the same range. That is invisible from a bare "no
+//: server found" and is the first thing worth ruling out.
+let lastProbeNotes = [];
+
+//: When a failure was last announced, so a 5 second retry loop cannot
+//: bury the editor in toasts. The state is available on demand from the
+//: menu; the toast only marks the transitions.
+let lastFailureToastAt = 0;
+//: How long to leave between unsolicited failure toasts.
+const FAILURE_TOAST_MS = 60000;
+
 function renewSocketId() {
   const previous = WS_ID;
   wsSerial += 1;
@@ -3861,6 +3891,34 @@ async function dispatch(raw) {
     return;
   }
 
+  // A SERVER THAT IS NOT OURS, ANSWERING ON A PORT WE SCANNED.
+  //
+  // The fallback discovery path has no /health check: with no fetch in
+  // the runtime it opens a WebSocket to each candidate port and keeps
+  // whichever connects. EasyEDA's own bridge server listens on the same
+  // ten ports and the same /eda path, so that path can attach to it,
+  // and nothing downstream would notice. Its handshake carries no
+  // `command`, so it used to be dropped here in silence while the
+  // extension stayed attached and reported itself connected. Every
+  // later command would then go to a server speaking a different
+  // protocol.
+  //
+  // It announces itself on connect, which is the opening this uses:
+  // {type: "handshake", service: "easyeda-bridge"}. Any service that
+  // names itself and is not us gets the socket closed, so the retry
+  // loop moves on to the next port instead of settling on the wrong
+  // server.
+  if (request && request.service && request.service !== SERVICE_ID) {
+    connected = false;
+    noteOutcome(
+      `port answered, but it is ${request.service}, not ${SERVICE_ID}`,
+    );
+    try {
+      eda.sys_WebSocket.close(WS_ID);
+    } catch (e) { /* it is going away regardless */ }
+    return;
+  }
+
   const { id, command, params } = request || {};
   if (!id || !command) return;
 
@@ -4295,6 +4353,7 @@ async function findServerByHealth() {
   // Ask each port who it is rather than assuming whatever answers is
   // ours. Another service on the port would otherwise get a WebSocket
   // handshake it never asked for.
+  lastProbeNotes = [];
   for (const port of candidatePorts()) {
     try {
       // BOUNDED. A fetch with no timeout of its own is how the whole
@@ -4319,6 +4378,15 @@ async function findServerByHealth() {
       if (body && body.service === SERVICE_ID) {
         return `ws://127.0.0.1:${port}/eda`;
       }
+      // Something is there and it is not us. Worth recording rather
+      // than skipping: this range and path are the ones EasyEDA's own
+      // bridge server uses, so the likeliest occupant is that server,
+      // and the two are then competing for the same ten ports. A bare
+      // "no server found" hides the difference between an empty range
+      // and a range somebody else already owns.
+      lastProbeNotes.push(
+        `${port}: ${(body && body.service) || 'answered, not a health reply'}`,
+      );
     } catch (e) {
       // Nothing listening there. Expected for most of the range.
     }
@@ -4381,6 +4449,7 @@ async function attach() {
     const url = configured || (await findServer());
 
     if (url) {
+      noteOutcome(`found a server, dialling ${url}`);
       openSocket(url);
       return;
     }
@@ -4404,6 +4473,22 @@ async function attach() {
         eda.sys_WebSocket.close(mine);
       } catch (e) { /* nothing was open */ }
     }
+
+    // Every candidate walked and nothing answered. Say so IN THE
+    // EDITOR. This path used to return in silence, which is the worst
+    // possible outcome to report: identical to never having installed
+    // the extension, and indistinguishable from a server that is up but
+    // unreachable.
+    noteOutcome(
+      lastProbeNotes.length
+        ? `no eda-agent server found. Ports answered by something else: ${lastProbeNotes.join(', ')}`
+        : `no eda-agent server found on ${PORT_START}-${PORT_END}. Is it running?`,
+    );
+    const now = Date.now();
+    if (now - lastFailureToastAt >= FAILURE_TOAST_MS) {
+      lastFailureToastAt = now;
+      toast(`eda-agent: ${lastOutcome}`);
+    }
   } finally {
     if (attachingSince === myAttach) {
       attaching = false;
@@ -4415,6 +4500,127 @@ function toast(text) {
   try {
     eda.sys_Message.showToastMessage(text);
   } catch (e) { /* nothing to show on runtimes without a UI */ }
+}
+
+function noteOutcome(text) {
+  lastOutcome = text;
+  lastOutcomeAt = Date.now();
+}
+
+// What the extension currently believes, shown in the editor.
+//
+// THE POINT. Everything else the extension knows about its own
+// connection is reported in the ping reply, over the socket, and is
+// therefore readable exactly when a connection already works. The
+// question anybody actually asks is the opposite one, and it has to be
+// answerable with no socket at all.
+//
+// It states the build too, because a re-import at a version already
+// installed is a silent no-op, so "the fix is not working" and "the fix
+// is not installed" look the same from here.
+// MODULE STATE ALONE IS NOT ENOUGH, and the first version of this that
+// shipped proved it. It reported "NOT connected, attempts 0, retry
+// timer NOT ARMED" while the server showed the editor connected, and
+// both were accurate.
+//
+// A mid-session re-import loads a SECOND copy of this module. The
+// editor fires onStartupFinished only at startup, so the new copy never
+// runs activate(), yet it is the copy wired to the freshly imported
+// menu. The older copy keeps the working socket and answers every
+// command. Asking the menu's copy how the connection is going therefore
+// asks the one that never made one.
+//
+// The server sees every copy, so the second half of this reads /health
+// and reports what IT observes, including which builds are actually
+// holding sockets. Comparing that against BUILD_ID is what distinguishes
+// "not connected" from "connected, but not by this copy of the code".
+export function status() {
+  const age =
+    lastOutcomeAt === 0
+      ? 'never'
+      : `${Math.round((Date.now() - lastOutcomeAt) / 1000)}s ago`;
+  const lines = [
+    `eda-agent ${BUILD_ID}`,
+    connected ? 'this copy believes it is CONNECTED' : 'this copy: NOT connected',
+    `last scan: ${lastOutcome} (${age})`,
+    `attempts ${attachAttempts}, sockets opened ${wsSerial}`,
+    `retry timer: ${retryTimer ? 'armed' : 'NOT ARMED'}`,
+  ];
+  if (attachAttempts === 0 && retryTimer === null) {
+    lines.push(
+      'This copy never started. It was imported mid session, so',
+      'another loaded copy probably holds the socket. Asking the server.',
+    );
+  }
+  toast(lines.join('\n'));
+
+  // Asked second and reported separately, so the local answer appears
+  // at once even on a runtime with no fetch and no server to ask.
+  askServer().then((seen) => {
+    if (!seen) {
+      toast(
+        hasFetch()
+          ? `eda-agent: no server answered on ${PORT_START}-${PORT_END}`
+          : 'eda-agent: this runtime has no fetch, so the server cannot be asked',
+      );
+      return;
+    }
+    // ABSENT IS NOT EMPTY. A server older than this field answers
+    // without editor_builds at all, and treating that as "no builds
+    // are connected" turns a question nobody asked into a confident
+    // wrong answer: it would report this build as not holding a socket
+    // when the server simply never said. Read nothing and nothing
+    // there have to stay distinguishable.
+    const lines = [
+      `server on ${seen.port}: editor ${seen.editor_connected ? 'CONNECTED' : 'not connected'}`,
+    ];
+    if (!Array.isArray(seen.editor_builds)) {
+      lines.push(
+        'that server does not report which builds hold sockets,',
+        'so whether this one does is unknown. Restart the server.',
+      );
+    } else if (seen.editor_builds.length === 0) {
+      lines.push('no build has identified itself to it yet');
+    } else {
+      lines.push(`builds holding sockets: ${seen.editor_builds.join(', ')}`);
+      lines.push(
+        seen.editor_builds.indexOf(BUILD_ID) !== -1
+          ? 'one of them is this build'
+          : `this build (${BUILD_ID}) is NOT one of them`,
+      );
+    }
+    toast(lines.join('\n'));
+  });
+
+  return lines.join('\n');
+}
+
+// What the server says, from whichever port answers first.
+async function askServer() {
+  if (!hasFetch()) return null;
+  for (const port of candidatePorts()) {
+    try {
+      const response = await Promise.race([
+        fetch(`http://127.0.0.1:${port}/health`, { method: 'GET' }),
+        delay(PROBE_MS * 4).then(() => null),
+      ]);
+      if (!response || !response.ok) continue;
+      const body = await Promise.race([
+        response.json(),
+        delay(PROBE_MS * 4).then(() => null),
+      ]);
+      if (body && body.service === SERVICE_ID) {
+        return {
+          port,
+          editor_connected: body.editor_connected,
+          editor_builds: body.editor_builds,
+        };
+      }
+    } catch (e) {
+      // Nothing there. Expected for most of the range.
+    }
+  }
+  return null;
 }
 
 export function connect() {
@@ -4513,6 +4719,10 @@ function openSocket(url) {
     },
     () => {
       connected = true;
+      noteOutcome(`connected to ${url}`);
+      // Reset the failure window, so the NEXT time it goes away the
+      // operator is told at once rather than after a quiet minute.
+      lastFailureToastAt = 0;
       eda.sys_Message.showToastMessage(`eda-agent connected: ${url}`);
     },
   );
